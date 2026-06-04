@@ -716,6 +716,23 @@ std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating_meta(
     return std::make_tuple(g, beta_output);
 }
 
+at::Tensor npu_fused_packed_recurrent_gated_delta_rule_meta(
+    const at::Tensor& mixed_qkv,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& a_log,
+    const at::Tensor& dt_bias,
+    at::Tensor& state,
+    const at::Tensor& ssm_state_indices,
+    const c10::optional<double> scale)
+{
+    int64_t B = mixed_qkv.size(0);
+    int64_t HV = a.size(1);
+    int64_t DV = state.size(2);
+    auto opts = a.options().dtype(at::ScalarType::BFloat16);
+    return at::empty({B, 1, HV, DV}, opts);
+}
+
 std::vector<at::Tensor> moe_grouped_matmul_meta(
     at::Tensor x,
     at::Tensor weight,
@@ -1624,6 +1641,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // recurrent_gated_delta_rule meta implementation
     ops.impl("npu_recurrent_gated_delta_rule", &vllm_ascend::meta::npu_recurrent_gated_delta_rule_meta);
+    // fused_packed_recurrent_gated_delta_rule meta implementation
+    ops.impl("npu_fused_packed_recurrent_gated_delta_rule", &vllm_ascend::meta::npu_fused_packed_recurrent_gated_delta_rule_meta);
     // Launch host print from device
     ops.impl("device_print", &vllm_ascend::meta::device_print_meta);
     // launch host print from device for tensors

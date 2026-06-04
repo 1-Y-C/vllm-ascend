@@ -195,6 +195,7 @@ else()
   )
 endif()
 
+set_target_properties(vllm_ascend_C PROPERTIES INTERPROCEDURAL_OPTIMIZATION OFF)
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/custom_transformer/op_api/lib")
 
 if(SOC_VERSION MATCHES "ascend310p.*|ascend950")

@@ -50,6 +50,7 @@
 #include "attention/recurrent_gated_delta_rule/recurrent_gated_delta_rule_torch_adpt.h"
 #include "attention/recurrent_gated_delta_rule_v310/recurrent_gated_delta_rule_310_torch_adpt.h"
 #include "attention/fused_gdn_gating/fused_gdn_gating_torch_adpt.h"
+#include "attention/fused_packed_recurrent_gated_delta_rule/fused_packed_recurrent_gated_delta_rule_torch_adpt.h"
 #include <c10/core/Device.h>
 #include <c10/core/Scalar.h>
 #include <c10/util/Exception.h>
@@ -2183,6 +2184,19 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                               Tensor? g=None, "
         "                               Tensor? gk=None) -> Tensor");
     ops.impl("npu_recurrent_gated_delta_rule", torch::kPrivateUse1, &vllm_ascend::npu_recurrent_gated_delta_rule);
+
+    ops.def(
+        "npu_fused_packed_recurrent_gated_delta_rule(Tensor mixed_qkv, "
+        "                                             Tensor a, "
+        "                                             Tensor b, "
+        "                                             Tensor a_log, "
+        "                                             Tensor dt_bias, "
+        "                                             Tensor(a!) state, "
+        "                                             Tensor ssm_state_indices, "
+        "                                             *, "
+        "                                             float? scale=None) -> Tensor");
+    ops.impl("npu_fused_packed_recurrent_gated_delta_rule", torch::kPrivateUse1,
+             &vllm_ascend::npu_fused_packed_recurrent_gated_delta_rule);
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
