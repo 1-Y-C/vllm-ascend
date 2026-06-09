@@ -260,8 +260,10 @@ log_selected_ops
   log "subshell cwd before cd=$(pwd)"
   cd csrc
   log "subshell cwd after cd=$(pwd)"
-  log "cleaning csrc build dirs"
-  rm -rf -- build output build_out
+  # [INCREMENTAL] Skip cleaning to preserve build artifacts.
+  # Uncomment the next line if you need a clean rebuild.
+  # rm -rf -- build output build_out
+  log "keeping existing build artifacts for incremental build"
 
   : "${ROOT_DIR:?ROOT_DIR is not set}"
   : "${CUSTOM_OPS:?CUSTOM_OPS is not set}"
