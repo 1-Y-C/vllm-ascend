@@ -1,39 +1,33 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * SPDX-License-Identifier: Apache-2.0
- */
-
-#ifndef __OP_HOST_FUSED_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_H__
-#define __OP_HOST_FUSED_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_H__
-
+#ifndef __OP_HOST_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_H__
+#define __OP_HOST_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_H__
 #include <tiling/tiling_api.h>
 #include "register/tilingdata_base.h"
 #include "tiling_base/tiling_base.h"
 #include "tiling_base/error_log.h"
-#include "../op_kernel/fused_packed_recurrent_gated_delta_rule_tiling_data.h"
+#include "../op_kernel/packed_recurrent_gated_delta_rule_tiling_data.h"
 
 namespace optiling {
 
-struct FusedPackedRecurrentGatedDeltaRuleCompileInfo {
+struct PackedRecurrentGatedDeltaRuleCompileInfo {
     uint64_t aivNum{0UL};
     uint64_t ubSize{0UL};
 };
 
-struct FusedPackedRecurrentGatedDeltaRuleInfo {
+struct PackedRecurrentGatedDeltaRuleInfo {
 public:
     int64_t usedCoreNum = 0;
-    const char *opName = "FusedPackedRecurrentGatedDeltaRule";
+    const char *opName = "PackedRecurrentGatedDeltaRule";
     float userScale = 0.0f;
 };
 
-class FusedPackedRecurrentGatedDeltaRuleTiling : public Ops::Transformer::OpTiling::TilingBaseClass {
+class PackedRecurrentGatedDeltaRuleTiling : public Ops::Transformer::OpTiling::TilingBaseClass {
 public:
-    explicit FusedPackedRecurrentGatedDeltaRuleTiling(gert::TilingContext *context)
+    explicit PackedRecurrentGatedDeltaRuleTiling(gert::TilingContext *context)
         : Ops::Transformer::OpTiling::TilingBaseClass(context)
     {
         InitCompileInfo();
     };
-    ~FusedPackedRecurrentGatedDeltaRuleTiling() override = default;
+    ~PackedRecurrentGatedDeltaRuleTiling() override = default;
 
 protected:
     bool IsCapable() override { return true; }
@@ -49,6 +43,7 @@ protected:
     void InitCompileInfo();
     void PrintTilingData();
 
+    using HostRuleFn = ge::graphStatus (PackedRecurrentGatedDeltaRuleTiling::*)();
     struct UbCalcContext {
         int64_t ubSize = 0;
         int64_t hk = 0;
@@ -90,11 +85,11 @@ protected:
     ge::graphStatus RuleCalcVStepCoeff();
     ge::graphStatus RuleFinalizeVStepFromUb();
 
-    FusedPackedRecurrentGatedDeltaRuleCompileInfo compileInfo_;
-    FusedPackedRecurrentGatedDeltaRule::FusedPackedRecurrentGatedDeltaRuleTilingData tilingData_;
-    FusedPackedRecurrentGatedDeltaRuleInfo inputParams_;
+    PackedRecurrentGatedDeltaRuleCompileInfo compileInfo_;
+    PackedRecurrentGatedDeltaRule::PackedRecurrentGatedDeltaRuleTilingData tilingData_;
+    PackedRecurrentGatedDeltaRuleInfo inputParams_;
     UbCalcContext ubCalcCtx_;
 };
 
 } // namespace optiling
-#endif
+#endif // __OP_HOST_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_H__

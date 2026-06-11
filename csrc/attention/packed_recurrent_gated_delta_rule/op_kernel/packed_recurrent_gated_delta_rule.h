@@ -1,11 +1,10 @@
-/** Copyright (c) 2026 Huawei Technologies Co., Ltd. SPDX-License-Identifier: Apache-2.0 */
-#ifndef FUSED_PACKED_RECURRENT_GATED_DELTA_RULE_KERNEL_H
-#define FUSED_PACKED_RECURRENT_GATED_DELTA_RULE_KERNEL_H
+#ifndef __PACKED_RECURRENT_GATED_DELTA_RULE_KERNEL_H_
+#define __PACKED_RECURRENT_GATED_DELTA_RULE_KERNEL_H_
 
 #include "kernel_operator.h"
-#include "fused_packed_recurrent_gated_delta_rule_tiling_data.h"
+#include "packed_recurrent_gated_delta_rule_tiling_data.h"
 
-namespace FusedPackedRecurrentGatedDeltaRule {
+namespace PackedRecurrentGatedDeltaRule {
 
 using namespace AscendC;
 
@@ -18,7 +17,7 @@ constexpr uint32_t MAX_REPEAT_TIME = 255;
 constexpr uint32_t ADD_FOLD_REDUCE_MIN_K = 128;
 constexpr bool kUseAddFoldReduce = false;
 
-struct FPRGDRInitParams {
+struct PackedRGDRInitParams {
     GM_ADDR mixedQkv;
     GM_ADDR a;
     GM_ADDR b;
@@ -31,9 +30,9 @@ struct FPRGDRInitParams {
 };
 
 template <typename inType, typename outType, typename stateType>
-class FPRGDR {
+class PackedRGDR {
 public:
-    __aicore__ inline explicit FPRGDR(const FusedPackedRecurrentGatedDeltaRuleTilingData *tilingData)
+    __aicore__ inline explicit PackedRGDR(const PackedRecurrentGatedDeltaRuleTilingData *tilingData)
     {
         B_ = tilingData->b;
         HK_ = tilingData->hk;
@@ -42,18 +41,16 @@ public:
         DV_ = tilingData->dv;
         sBlockNum_ = tilingData->sBlockNum;
         scale_ = tilingData->scale;
-        vStep_ = tilingData->vStep > 0 ? tilingData->vStep : 16;
+        vStep_ = tilingData->vStep;
         stateOutBufferNum_ = (tilingData->stateOutBufferNum == MAX_OUT_BUFFER_NUM) ? MAX_OUT_BUFFER_NUM : BUFFER_NUM;
         attnOutBufferNum_ = (tilingData->attnOutBufferNum == MAX_OUT_BUFFER_NUM) ? MAX_OUT_BUFFER_NUM : BUFFER_NUM;
-        if (stateOutBufferNum_ == 0) stateOutBufferNum_ = BUFFER_NUM;
-        if (attnOutBufferNum_ == 0) attnOutBufferNum_ = BUFFER_NUM;
         alignK_ = Ceil(DK_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         alignV_ = Ceil(DV_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         qkvDim_ = 2 * HK_ * DK_ + HV_ * DV_;
         numKVGroups_ = HV_ / HK_;
     }
 
-    __aicore__ inline void Init(const FPRGDRInitParams &initParams, TPipe *pipe)
+    __aicore__ inline void Init(const PackedRGDRInitParams &initParams, TPipe *pipe)
     {
         blockIdx = GetBlockIdx();
         if (blockIdx >= GetBlockNum()) return;
@@ -62,7 +59,7 @@ public:
         InitLocalBuffers();
     }
 
-    __aicore__ inline void SetGlobalTensors(const FPRGDRInitParams &initParams)
+    __aicore__ inline void SetGlobalTensors(const PackedRGDRInitParams &initParams)
     {
         mixedQkvGm_.SetGlobalBuffer((__gm__ inType *)initParams.mixedQkv);
         aGm_.SetGlobalBuffer((__gm__ inType *)initParams.a);
@@ -77,14 +74,41 @@ public:
 
     __aicore__ inline void InitLocalBuffers()
     {
-        // DEBUG: minimal allocation - just what's needed to not crash
-        pipe_->InitBuffer(qInUb_, 128);
-        pipe_->InitBuffer(kInUb_, 128);
+        pipe_->InitBuffer(qInQueue_, BUFFER_NUM, HK_ * alignK_ * sizeof(inType));
+        pipe_->InitBuffer(kInQueue_, BUFFER_NUM, HK_ * alignK_ * sizeof(inType));
+        pipe_->InitBuffer(vInQueue_, BUFFER_NUM, vStep_ * sizeof(inType));
+        pipe_->InitBuffer(stateInQueue_, BUFFER_NUM, vStep_ * alignK_ * sizeof(stateType));
+        pipe_->InitBuffer(stateOutQueue_, stateOutBufferNum_, vStep_ * alignK_ * sizeof(stateType));
+        pipe_->InitBuffer(attnOutQueue_, attnOutBufferNum_, vStep_ * sizeof(outType));
+
+        pipe_->InitBuffer(qInUb_, HK_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(kInUb_, HK_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(vInUb_, vStep_ * sizeof(float));
+        pipe_->InitBuffer(stateInUb_, vStep_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(broadTmpUb_, vStep_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(deltaUb_, vStep_ * sizeof(float));
+        pipe_->InitBuffer(attnUb_, vStep_ * sizeof(float));
+        pipe_->InitBuffer(gUb_, Ceil(HV_, FP32_NUM_PER_BLOCK) * FP32_NUM_PER_BLOCK * sizeof(float));
+        pipe_->InitBuffer(betaUb_, Ceil(HV_, FP32_NUM_PER_BLOCK) * FP32_NUM_PER_BLOCK * sizeof(float));
+        pipe_->InitBuffer(tmpUb_, (HK_ * alignK_ + 2 * Ceil(HV_, FP32_NUM_PER_BLOCK)) * FP32_NUM_PER_BLOCK * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        return;
+        for (uint64_t batchIdx = blockIdx; batchIdx < B_; batchIdx += GetBlockNum()) {
+            int32_t stateIdx = ssmStateIndicesGm_.GetValue(batchIdx);
+            if (stateIdx < 0) continue;
+            if (static_cast<uint32_t>(stateIdx) >= sBlockNum_) continue;
+
+            ComputeGBeta(batchIdx);
+
+            LoadQK(batchIdx);
+
+            for (uint64_t hv = 0; hv < HV_; hv++) {
+                Duplicate(stateInUb_.Get<float>(), 0.0f, vStep_ * alignK_);
+                ProcessHead(batchIdx, hv, stateIdx);
+            }
+        }
     }
 
 private:
@@ -115,37 +139,6 @@ private:
                 Duplicate<float>(qUb[h * alignK_ + DK_], 0.0f, alignK_ - DK_);
                 Duplicate<float>(kUb[h * alignK_ + DK_], 0.0f, alignK_ - DK_);
             }
-        }
-
-        // L2Norm Q and K (per head), then scale Q.
-        {
-            LocalTensor<float> qUb = qInUb_.Get<float>();
-            LocalTensor<float> kUb = kInUb_.Get<float>();
-            const float eps = 1e-6f;
-            for (uint32_t h = 0; h < HK_; h++) {
-                float qSq = 0.0f, kSq = 0.0f;
-                for (uint32_t i = 0; i < DK_; i++) {
-                    float qv = qUb.GetValue(h * alignK_ + i);
-                    float kv = kUb.GetValue(h * alignK_ + i);
-                    qSq += qv * qv;
-                    kSq += kv * kv;
-                }
-                float qInvRms = 1.0f / sqrtf(qSq + eps);
-                float kInvRms = 1.0f / sqrtf(kSq + eps);
-                for (uint32_t i = 0; i < DK_; i++) {
-                    qUb.SetValue(h * alignK_ + i,
-                                 qUb.GetValue(h * alignK_ + i) * qInvRms);
-                    kUb.SetValue(h * alignK_ + i,
-                                 kUb.GetValue(h * alignK_ + i) * kInvRms);
-                }
-            }
-        }
-        PipeBarrier<PIPE_V>();
-
-        // Scale Q
-        if (scale_ != 1.0f) {
-            Muls(qInUb_.Get<float>(), qInUb_.Get<float>(), scale_, HK_ * DK_);
-            PipeBarrier<PIPE_V>();
         }
     }
 
@@ -311,6 +304,7 @@ private:
 
     __aicore__ inline void WriteAttn(uint64_t batchIdx, uint64_t hv, uint64_t v0, uint32_t curV)
     {
+        // Write attnUb (normal behavior)
         LocalTensor<outType> outLocal = attnOutQueue_.AllocTensor<outType>();
         uint64_t attnOffset = batchIdx * HV_ * DV_ + hv * DV_ + v0;
         Cast(outLocal, attnUb_.Get<float>(), RoundMode::CAST_ROUND, curV);
@@ -377,9 +371,59 @@ private:
         ReduceSum<float, Pattern::Reduce::AR, true>(dstTensor, srcTensor, rsShape, true);
     }
 
+    __aicore__ inline bool CanUseK128AddFoldFastPath(uint32_t rows) const
+    {
+        if (alignK_ != ADD_FOLD_REDUCE_MIN_K) return false;
+        if (rows == 0 || rows > MAX_REPEAT_TIME) return false;
+        return true;
+    }
+
+    __aicore__ inline void ReduceSumAddFoldK128(LocalTensor<float> &dstTensor, LocalTensor<float> &srcTensor,
+                                                 uint32_t rows)
+    {
+        const uint8_t repeatTime = static_cast<uint8_t>(rows);
+        const uint8_t rowRepStride = static_cast<uint8_t>(alignK_ / FP32_NUM_PER_BLOCK);
+        Add(srcTensor[REPEAT_LENTH], srcTensor, srcTensor[REPEAT_LENTH], REPEAT_LENTH, repeatTime,
+            {1, 1, 1, rowRepStride, rowRepStride, rowRepStride});
+        PipeBarrier<PIPE_V>();
+        WholeReduceSum(dstTensor, srcTensor[REPEAT_LENTH], REPEAT_LENTH, repeatTime, 1, 1, rowRepStride);
+    }
+
+    __aicore__ inline void ReduceSumAddFold(LocalTensor<float> &dstTensor, LocalTensor<float> &srcTensor,
+                                             uint32_t rows)
+    {
+        if (alignK_ < REPEAT_LENTH) {
+            ReduceSumBaseline(dstTensor, srcTensor, rows);
+            return;
+        }
+        if ((alignK_ & (alignK_ - 1)) != 0) {
+            ReduceSumBaseline(dstTensor, srcTensor, rows);
+            return;
+        }
+        if (CanUseK128AddFoldFastPath(rows)) {
+            ReduceSumAddFoldK128(dstTensor, srcTensor, rows);
+            return;
+        }
+        for (uint32_t row = 0; row < rows; ++row) {
+            uint32_t rowOffset = row * alignK_;
+            uint32_t activeLen = alignK_;
+            while (activeLen > REPEAT_LENTH) {
+                uint32_t half = activeLen >> 1;
+                Add(srcTensor[rowOffset], srcTensor[rowOffset], srcTensor[rowOffset + half], half);
+                PipeBarrier<PIPE_V>();
+                activeLen = half;
+            }
+            WholeReduceSum(dstTensor[row], srcTensor[rowOffset], REPEAT_LENTH, 1, 1, 1, FP32_NUM_PER_BLOCK);
+        }
+    }
+
     __aicore__ inline void ReduceSumDispatch(LocalTensor<float> &dstTensor, LocalTensor<float> &srcTensor,
                                               uint32_t rows)
     {
+        if (kUseAddFoldReduce && alignK_ >= ADD_FOLD_REDUCE_MIN_K) {
+            ReduceSumAddFold(dstTensor, srcTensor, rows);
+            return;
+        }
         ReduceSumBaseline(dstTensor, srcTensor, rows);
     }
 
@@ -406,5 +450,5 @@ private:
     GlobalTensor<outType> attnOutGm_;
 };
 
-} // namespace FusedPackedRecurrentGatedDeltaRule
+} // namespace PackedRecurrentGatedDeltaRule
 #endif

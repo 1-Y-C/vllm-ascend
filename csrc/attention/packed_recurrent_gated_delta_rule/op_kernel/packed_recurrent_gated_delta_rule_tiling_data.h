@@ -1,11 +1,11 @@
-#ifndef FUSED_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_DATA_H
-#define FUSED_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_DATA_H
+#ifndef PACKED_RECURRENT_GATED_DELTA_RULE_TILING_DATA_H
+#define PACKED_RECURRENT_GATED_DELTA_RULE_TILING_DATA_H
 
 #include "kernel_tiling/kernel_tiling.h"
 
-namespace FusedPackedRecurrentGatedDeltaRule {
+namespace PackedRecurrentGatedDeltaRule {
 #pragma pack(push, 8)
-struct alignas(8) FusedPackedRecurrentGatedDeltaRuleTilingData {
+struct alignas(8) PackedRecurrentGatedDeltaRuleTilingData {
     uint32_t vectorCoreNum;
     uint32_t ubCalSize;
     uint32_t ubRestBytes;
@@ -21,6 +21,6 @@ struct alignas(8) FusedPackedRecurrentGatedDeltaRuleTilingData {
     float scale;
 };
 #pragma pack(pop)
-} // FusedPackedRecurrentGatedDeltaRule
+} // PackedRecurrentGatedDeltaRule
 
-#endif // FUSED_PACKED_RECURRENT_GATED_DELTA_RULE_TILING_DATA_H
+#endif // PACKED_RECURRENT_GATED_DELTA_RULE_TILING_DATA_H

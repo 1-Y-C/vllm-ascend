@@ -1,10 +1,4 @@
-/**
- * Copyright (c) 2026 Huawei Technologies Co., Ltd.
- * SPDX-License-Identifier: Apache-2.0
- * SPDX-FileCopyrightText: Copyright contributors to the vllm-ascend project
- */
-
-#include "fused_packed_recurrent_gated_delta_rule_tiling.h"
+#include "packed_recurrent_gated_delta_rule_tiling.h"
 
 #include "register/op_impl_registry.h"
 #include "register/op_def_registry.h"
@@ -17,18 +11,25 @@ namespace optiling {
 
 const size_t MIXED_QKV_INDEX = 0;
 const size_t A_INDEX = 1;
+const size_t SSM_STATE_INDICES_INDEX = 6;
 const size_t STATE_INDEX = 5;
 
 const size_t DIM_0 = 0;
 const size_t DIM_1 = 1;
 const size_t DIM_2 = 2;
 const size_t DIM_3 = 3;
+const size_t DIM_4 = 4;
 
 constexpr int64_t FP32_SIZE = 4;
 constexpr int64_t BF16_SIZE = 2;
+constexpr int64_t FP16_SIZE = 2;
+constexpr int64_t INT32_SIZE = 4;
+constexpr int64_t BLOCK_SIZE = 32;
+constexpr int64_t BF16_PER_BLOCK = 16;
 constexpr int64_t FP32_PER_BLOCK = 8;
+constexpr int64_t REPEAT_MASK = 64;
 
-void FusedPackedRecurrentGatedDeltaRuleTiling::InitCompileInfo()
+void PackedRecurrentGatedDeltaRuleTiling::InitCompileInfo()
 {
     auto platformInfoPtr = context_->GetPlatformInfo();
     if (platformInfoPtr == nullptr) {
@@ -43,17 +44,17 @@ void FusedPackedRecurrentGatedDeltaRuleTiling::InitCompileInfo()
     }
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::GetPlatformInfo()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::GetPlatformInfo()
 {
     auto platformInfoPtr = context_->GetPlatformInfo();
     if (platformInfoPtr == nullptr) {
-        OP_LOGE(context_->GetNodeName(), "platformInfoPtr is null");
+        OP_LOGE(context_->GetNodeName(), "platformInfoPtr is null when getting platform info");
         return ge::GRAPH_FAILED;
     }
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::GetShapeAttrsInfo()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::GetShapeAttrsInfo()
 {
     auto attrs = context_->GetAttrs();
     if (attrs != nullptr) {
@@ -65,7 +66,7 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::GetShapeAttrsInfo()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::DoOpTiling()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::DoOpTiling()
 {
     auto ret = RuleInitUbCalcContext();
     if (ret != ge::GRAPH_SUCCESS) return ret;
@@ -80,27 +81,27 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::DoOpTiling()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::DoLibApiTiling()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::DoLibApiTiling()
 {
     return ge::GRAPH_SUCCESS;
 }
 
-uint64_t FusedPackedRecurrentGatedDeltaRuleTiling::GetTilingKey() const
+uint64_t PackedRecurrentGatedDeltaRuleTiling::GetTilingKey() const
 {
     return 0;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::GetWorkspaceSize()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::GetWorkspaceSize()
 {
     constexpr int64_t sysWorkspaceSize = 16777216;
     workspaceSize_ = sysWorkspaceSize;
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::PostTiling()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::PostTiling()
 {
     context_->SetBlockDim(tilingData_.vectorCoreNum);
-    auto tilingDataSize = sizeof(FusedPackedRecurrentGatedDeltaRule::FusedPackedRecurrentGatedDeltaRuleTilingData);
+    auto tilingDataSize = sizeof(PackedRecurrentGatedDeltaRule::PackedRecurrentGatedDeltaRuleTilingData);
     errno_t ret = memcpy_s(context_->GetRawTilingData()->GetData(), context_->GetRawTilingData()->GetCapacity(),
                            reinterpret_cast<void *>(&tilingData_), tilingDataSize);
     if (ret != EOK) {
@@ -118,7 +119,7 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::PostTiling()
     return ge::GRAPH_SUCCESS;
 }
 
-void FusedPackedRecurrentGatedDeltaRuleTiling::PrintTilingData()
+void PackedRecurrentGatedDeltaRuleTiling::PrintTilingData()
 {
     OP_LOGI(inputParams_.opName,
             "B:%u HK:%u DK:%u HV:%u DV:%u sBlockNum:%u vStep:%u bufNum[%u/%u] scale:%f",
@@ -127,11 +128,22 @@ void FusedPackedRecurrentGatedDeltaRuleTiling::PrintTilingData()
             tilingData_.attnOutBufferNum, tilingData_.scale);
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::CheckContext() { return ge::GRAPH_SUCCESS; }
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::AnalyzeDtype() { return ge::GRAPH_SUCCESS; }
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::AnalyzeShapes() { return FillTilingShapeData(); }
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::CheckContext()
+{
+    return ge::GRAPH_SUCCESS;
+}
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::FillTilingShapeData()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::AnalyzeDtype()
+{
+    return ge::GRAPH_SUCCESS;
+}
+
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::AnalyzeShapes()
+{
+    return FillTilingShapeData();
+}
+
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::FillTilingShapeData()
 {
     auto mixedQkvShapePtr = context_->GetInputShape(MIXED_QKV_INDEX);
     auto aShapePtr = context_->GetInputShape(A_INDEX);
@@ -160,7 +172,7 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::FillTilingShapeData()
     int64_t qkDim = 2 * static_cast<int64_t>(tilingData_.dk);
     int64_t expectedHeadDim = static_cast<int64_t>(tilingData_.hv) * static_cast<int64_t>(tilingData_.dv);
     if (mixedQkvLastDim < expectedHeadDim) {
-        OP_LOGE(context_->GetNodeName(), "mixedQkv shape mismatch");
+        OP_LOGE(context_->GetNodeName(), "mixedQkv shape mismatch: lastDim=%ld < hv*dv=%ld", mixedQkvLastDim, expectedHeadDim);
         return ge::GRAPH_FAILED;
     }
     tilingData_.hk = static_cast<uint32_t>((mixedQkvLastDim - expectedHeadDim) / qkDim);
@@ -177,26 +189,31 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::FillTilingShapeData()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::CalUbSize() { return ge::GRAPH_SUCCESS; }
-
-int64_t FusedPackedRecurrentGatedDeltaRuleTiling::CalcFixedUbBytes(int64_t hv, int64_t dv, int64_t dk, int64_t hk) const
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::CalUbSize()
 {
-    // qInQueue + kInQueue (HK heads) + vInQueue
+    return ge::GRAPH_SUCCESS;
+}
+
+int64_t PackedRecurrentGatedDeltaRuleTiling::CalcFixedUbBytes(int64_t hv, int64_t dv, int64_t dk, int64_t hk) const
+{
+    // qInQueue + kInQueue (HK heads) + vInQueue (single head)
     int64_t queueBytes = hk * dk * BF16_SIZE + hk * dk * BF16_SIZE + dv * BF16_SIZE;
     // qInUb + kInUb + vInUb (fp32, HK heads for q/k)
     int64_t qkUbBytes = hk * dk * FP32_SIZE * 2 + dv * FP32_SIZE;
-    // Gating buffers: g + beta (fp32), aligned to 8
-    int64_t hvAligned = ((hv + FP32_PER_BLOCK - 1) / FP32_PER_BLOCK) * FP32_PER_BLOCK;
-    int64_t gatingBytes = hvAligned * FP32_SIZE * 2;
-    // tmpUb
-    int64_t tmpBytes = (hk * dk + 2 * hvAligned) * FP32_SIZE;
+    // Gating buffers: g + beta (fp32)
+    int64_t gatingBytes = hv * FP32_SIZE * 2;
+    // tmpUb for L2Norm (HK heads)
+    int64_t tmpBytes = hk * dk * FP32_SIZE;
     return queueBytes + qkUbBytes + gatingBytes + tmpBytes;
 }
 
-int64_t FusedPackedRecurrentGatedDeltaRuleTiling::CalcWorkingUbBytes(int64_t hv, int64_t dv, int64_t dk, int64_t hk) const
+int64_t PackedRecurrentGatedDeltaRuleTiling::CalcWorkingUbBytes(int64_t hv, int64_t dv, int64_t dk, int64_t hk) const
 {
-    (void)hv; (void)dv; (void)hk;
-    int64_t vStepBytes = dk * FP32_SIZE    // stateInQueue (float32, per row)
+    (void)hv;
+    (void)dv;
+    (void)hk;
+    // stateInQueue + stateInUb + broadTmpUb + deltaUb + attnUb (per vStep)
+    int64_t vStepBytes = dk * BF16_SIZE    // stateInQueue
                        + dk * FP32_SIZE    // stateInUb
                        + dk * FP32_SIZE    // broadTmpUb
                        + FP32_SIZE         // deltaUb
@@ -204,12 +221,12 @@ int64_t FusedPackedRecurrentGatedDeltaRuleTiling::CalcWorkingUbBytes(int64_t hv,
     return vStepBytes;
 }
 
-int64_t FusedPackedRecurrentGatedDeltaRuleTiling::CalcVStepCoeff(int64_t dk,
+int64_t PackedRecurrentGatedDeltaRuleTiling::CalcVStepCoeff(int64_t dk,
     uint32_t stateOutBufferNum, uint32_t attnOutBufferNum) const
 {
-    int64_t coeff = dk * FP32_SIZE                       // stateInQueue (float32, per vStep)
-                   + dk * FP32_SIZE * stateOutBufferNum  // stateOutQueue (float32) per vStep
-                   + static_cast<int64_t>(attnOutBufferNum) * 2 // attnOutQueue per vStep
+    int64_t coeff = dk * BF16_SIZE                       // stateInQueue
+                   + dk * BF16_SIZE * stateOutBufferNum  // stateOutQueue per vStep
+                   + static_cast<int64_t>(attnOutBufferNum) * 2 // attnOutQueue per vStep (bf16/fp16)
                    + dk * FP32_SIZE                      // stateInUb
                    + dk * FP32_SIZE                      // broadTmpUb
                    + FP32_SIZE                           // deltaUb
@@ -217,29 +234,44 @@ int64_t FusedPackedRecurrentGatedDeltaRuleTiling::CalcVStepCoeff(int64_t dk,
     return coeff;
 }
 
-bool FusedPackedRecurrentGatedDeltaRuleTiling::EvaluateBufferProfile(int64_t ubSize, int64_t usedUbBytes,
+bool PackedRecurrentGatedDeltaRuleTiling::EvaluateBufferProfile(int64_t ubSize, int64_t usedUbBytes,
     int64_t dk, uint32_t stateOutBufferNum, uint32_t attnOutBufferNum, BufferProfile &profile) const
 {
+    (void)attnOutBufferNum;
     int64_t remainBytes = ubSize - usedUbBytes;
-    if (remainBytes <= 0) { profile.valid = false; return false; }
+    if (remainBytes <= 0) {
+        profile.valid = false;
+        return false;
+    }
     int64_t coeff = CalcVStepCoeff(dk, stateOutBufferNum, attnOutBufferNum);
-    if (coeff <= 0) { profile.valid = false; return false; }
+    if (coeff <= 0) {
+        profile.valid = false;
+        return false;
+    }
     int64_t maxVStep = remainBytes / coeff;
-    if (maxVStep <= 0) { profile.valid = false; return false; }
+    if (maxVStep <= 0) {
+        profile.valid = false;
+        return false;
+    }
+    // Align to 32B boundary
     maxVStep = (maxVStep / FP32_PER_BLOCK) * FP32_PER_BLOCK;
-    if (maxVStep <= 0) { profile.valid = false; return false; }
+    if (maxVStep <= 0) {
+        profile.valid = false;
+        return false;
+    }
+    // Use max possible vStep (at most dv)
     int64_t dv = static_cast<int64_t>(tilingData_.dv);
     profile.vStep = static_cast<uint32_t>(maxVStep < dv ? maxVStep : dv);
     profile.stateOutBufferNum = stateOutBufferNum;
     profile.attnOutBufferNum = attnOutBufferNum;
-    profile.repeatTime = static_cast<uint32_t>(dk / maxVStep);
+    profile.repeatTime = static_cast<uint32_t>(128 / maxVStep);
     if (profile.repeatTime < 1) profile.repeatTime = 1;
     profile.valid = true;
     return true;
 }
 
-bool FusedPackedRecurrentGatedDeltaRuleTiling::IsBetterProfile(const BufferProfile &candidate,
-                                                               const BufferProfile &current) const
+bool PackedRecurrentGatedDeltaRuleTiling::IsBetterProfile(const BufferProfile &candidate,
+                                                           const BufferProfile &current) const
 {
     if (!current.valid) return true;
     if (candidate.repeatTime < current.repeatTime) return true;
@@ -247,17 +279,19 @@ bool FusedPackedRecurrentGatedDeltaRuleTiling::IsBetterProfile(const BufferProfi
     return false;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::FinalizeVStepFromUb()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::FinalizeVStepFromUb()
 {
     auto fixedBytes = ubCalcCtx_.fixedUbBytes;
+    auto workingBytes = ubCalcCtx_.workingUbBytes;
     auto totalUb = ubCalcCtx_.ubSize;
 
+    // Evaluate buffer profiles for different buffer configurations
     BufferProfile bestProfile;
+    BufferProfile profile;
     for (uint32_t sb = 1; sb <= 2; sb++) {
         for (uint32_t ab = 1; ab <= 2; ab++) {
-            BufferProfile profile;
             int64_t stepCoeff = CalcVStepCoeff(ubCalcCtx_.dk, sb, ab);
-            int64_t usedBytes = fixedBytes + stepCoeff; // single vStep estimate
+            int64_t usedBytes = fixedBytes + workingBytes * (1); // single vStep estimate
             EvaluateBufferProfile(totalUb, usedBytes, ubCalcCtx_.dk, sb, ab, profile);
             if (profile.valid && IsBetterProfile(profile, bestProfile)) {
                 bestProfile = profile;
@@ -268,7 +302,8 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::FinalizeVStepFromUb()
     }
 
     if (!bestProfile.valid) {
-        tilingData_.vStep = 16;
+        // Fallback: minimal vStep
+        tilingData_.vStep = 1;
         tilingData_.stateOutBufferNum = 1;
         tilingData_.attnOutBufferNum = 1;
     } else {
@@ -279,7 +314,7 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::FinalizeVStepFromUb()
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::RuleInitUbCalcContext()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::RuleInitUbCalcContext()
 {
     AnalyzeShapes();
     ubCalcCtx_.ubSize = static_cast<int64_t>(compileInfo_.ubSize);
@@ -290,43 +325,43 @@ ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::RuleInitUbCalcContext(
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::RuleCalcFixedUbBytes()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::RuleCalcFixedUbBytes()
 {
     ubCalcCtx_.fixedUbBytes = CalcFixedUbBytes(ubCalcCtx_.hv, ubCalcCtx_.dv, ubCalcCtx_.dk, ubCalcCtx_.hk);
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::RuleCalcWorkingUbBytes()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::RuleCalcWorkingUbBytes()
 {
     ubCalcCtx_.workingUbBytes = CalcWorkingUbBytes(ubCalcCtx_.hv, ubCalcCtx_.dv, ubCalcCtx_.dk, ubCalcCtx_.hk);
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::RuleCalcVStepCoeff()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::RuleCalcVStepCoeff()
 {
     ubCalcCtx_.coeff = CalcVStepCoeff(ubCalcCtx_.dk, 1, 1);
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedPackedRecurrentGatedDeltaRuleTiling::RuleFinalizeVStepFromUb()
+ge::graphStatus PackedRecurrentGatedDeltaRuleTiling::RuleFinalizeVStepFromUb()
 {
     return FinalizeVStepFromUb();
 }
 
-ge::graphStatus TilingForFusedPackedRecurrentGatedDeltaRule(gert::TilingContext *context)
+ge::graphStatus TilingForPackedRecurrentGatedDeltaRule(gert::TilingContext *context)
 {
-    optiling::FusedPackedRecurrentGatedDeltaRuleTiling tiling(context);
+    optiling::PackedRecurrentGatedDeltaRuleTiling tiling(context);
     return tiling.DoTiling();
 }
 
-ge::graphStatus TilingParseForFusedPackedRecurrentGatedDeltaRule(gert::TilingParseContext *context)
+ge::graphStatus TilingParseForPackedRecurrentGatedDeltaRule(gert::TilingParseContext *context)
 {
     (void)context;
     return ge::GRAPH_SUCCESS;
 }
 
-IMPL_OP_OPTILING(FusedPackedRecurrentGatedDeltaRule)
-    .Tiling(TilingForFusedPackedRecurrentGatedDeltaRule)
-    .TilingParse<FusedPackedRecurrentGatedDeltaRuleCompileInfo>(TilingParseForFusedPackedRecurrentGatedDeltaRule);
+IMPL_OP_OPTILING(PackedRecurrentGatedDeltaRule)
+    .Tiling(TilingForPackedRecurrentGatedDeltaRule)
+    .TilingParse<PackedRecurrentGatedDeltaRuleCompileInfo>(TilingParseForPackedRecurrentGatedDeltaRule);
 
 } // namespace optiling

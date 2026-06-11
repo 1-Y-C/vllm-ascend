@@ -370,6 +370,72 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = rearrange(core_attn_out, "... h d -> ... (h d)")
         output[:num_tokens], _ = self.out_proj(core_attn_out)
 
+    def _forward_core_decode_non_spec(
+        self,
+        mixed_qkv: torch.Tensor,
+        b: torch.Tensor,
+        a: torch.Tensor,
+        core_attn_out: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ):
+        """Core attention for pure non-spec decode with packed mixed_qkv.
+
+        Fusing: conv1d update on packed layout → L2Norm(Q,K) + Q scaling
+        + gating + delta-rule recurrence in a single AscendC kernel.
+
+        Args:
+            mixed_qkv: [B, 2*H*K + HV*V] bf16, already truncated.
+            b: [B, HV] bf16, already truncated.
+            a: [B, HV] bf16, already truncated.
+            core_attn_out: Pre-allocated output buffer [num_tokens, HV, V] bf16.
+            attn_metadata: GDN attention metadata.
+        """
+        non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+        non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
+        self_kv_cache = self.kv_cache
+        ssm_state = self_kv_cache[1]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+
+        # --- Step 1: causal conv1d update on packed mixed_qkv ---
+        conv_weights = self.conv1d.weight.view(
+            self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+        )
+        conv_weights_T = conv_weights.transpose(0, 1)
+        activation_num = 1 if self.activation else 0
+        output_conv = torch.empty_like(mixed_qkv)
+        torch.ops._C_ascend.npu_causal_conv1d_custom(
+            output_conv,
+            mixed_qkv,
+            conv_weights_T,
+            conv_state=self_kv_cache[0],
+            bias_opt=self.conv1d.bias,
+            query_start_loc_opt=to_int64_tuple(
+                non_spec_query_start_loc[: num_actual_tokens + 1]
+            ),
+            cache_indices_opt=to_int64_tuple(
+                non_spec_state_indices_tensor[:num_actual_tokens]
+            ),
+            initial_state_mode_opt=(),
+            num_accepted_tokens_opt=(),
+            activation_mode=activation_num,
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=1,
+        )
+
+        # --- Step 2: fused L2Norm + gating + recurrence ---
+        out_kernel = torch.ops._C_ascend.npu_fused_packed_recurrent_gated_delta_rule(
+            output_conv,
+            a,
+            b,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            non_spec_state_indices_tensor[:num_actual_tokens],
+            scale=self.head_k_dim ** -0.5,
+        )
+        # Kernel returns [B, 1, HV, V]; core_attn_out expects [B, HV, V].
+        core_attn_out[:num_actual_tokens] = out_kernel.squeeze(1)
+
     def _forward_core(
         self,
         mixed_qkv: torch.Tensor,
@@ -406,6 +472,21 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
+
+        # Fast path: pure non-spec decode — skip rearrange / standalone
+        # l2norm / separate gating and use the packed fused kernel instead.
+        if (
+            spec_sequence_masks is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+        ):
+            return self._forward_core_decode_non_spec(
+                mixed_qkv=mixed_qkv,
+                b=b,
+                a=a,
+                core_attn_out=core_attn_out,
+                attn_metadata=attn_metadata,
+            )
 
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))

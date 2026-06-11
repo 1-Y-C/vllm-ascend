@@ -24,8 +24,8 @@ const size_t STATE_INDEX = 5;
 const size_t OUTPUT_INDEX = 0;
 const size_t STATE_OUT_INDEX = 1;
 
-// Output: [B, HV, V]
-const size_t OUTPUT_DIM = 3;
+// Output: [B, 1, HV, V]
+const size_t OUTPUT_DIM = 4;
 // State: [N, HV, V, K]
 const size_t STATE_DIM = 4;
 
@@ -52,14 +52,15 @@ static ge::graphStatus InferShapeFusedPackedRecurrentGatedDeltaRule(InferShapeCo
         return ge::GRAPH_FAILED;
     }
 
-    // out: [B, HV, V] — B from a, HV from a, V from state
+    // out: [B, 1, HV, V] — B from a, HV from a, V from state
     shapeOut->SetDimNum(OUTPUT_DIM);
     int64_t B  = shapeA->GetDim(DIM_0);
     int64_t HV = shapeA->GetDim(DIM_1);
     int64_t V  = shapeState->GetDim(DIM_2);
-    shapeOut->SetDim(DIM_0, B);
-    shapeOut->SetDim(DIM_1, HV);
-    shapeOut->SetDim(DIM_2, V);
+    shapeOut->SetDim(0, B);
+    shapeOut->SetDim(1, 1);
+    shapeOut->SetDim(2, HV);
+    shapeOut->SetDim(3, V);
 
     // finalState: [N, HV, V, K] — same as input state
     shapeFinalState->SetDimNum(STATE_DIM);
