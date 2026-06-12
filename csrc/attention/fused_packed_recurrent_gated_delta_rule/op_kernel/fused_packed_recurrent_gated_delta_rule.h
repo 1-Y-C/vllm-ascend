@@ -77,14 +77,62 @@ public:
 
     __aicore__ inline void InitLocalBuffers()
     {
-        // DEBUG: minimal allocation - just what's needed to not crash
-        pipe_->InitBuffer(qInUb_, 128);
-        pipe_->InitBuffer(kInUb_, 128);
+        uint32_t hvAligned = Ceil(HV_, FP32_NUM_PER_BLOCK) * FP32_NUM_PER_BLOCK;
+        constexpr uint32_t BLOCK = 32;
+
+        // Queue buffers (for async data transfer)
+        // TQue InitBuffer: (queue, num_buffers, buffer_size)
+        uint32_t qQueueSize = (HK_ * DK_ * sizeof(inType) > Ceil(HV_ * sizeof(inType), BLOCK))
+                              ? HK_ * DK_ * sizeof(inType)
+                              : Ceil(HV_ * sizeof(inType), BLOCK);
+        uint32_t kQueueSize = (HK_ * DK_ * sizeof(inType) > Ceil(HV_ * sizeof(inType), BLOCK))
+                              ? HK_ * DK_ * sizeof(inType)
+                              : Ceil(HV_ * sizeof(inType), BLOCK);
+        uint32_t vQueueSize = vStep_ * sizeof(inType);
+        uint32_t stateInQueueSize = vStep_ * DK_ * sizeof(stateType);
+        uint32_t stateOutQueueSize = vStep_ * DK_ * sizeof(stateType);
+        uint32_t attnOutQueueSize = vStep_ * sizeof(outType);
+        uint32_t tmpUbSize = (hvAligned > HK_ * alignK_) ? hvAligned : HK_ * alignK_;
+
+        pipe_->InitBuffer(qInQueue_, BUFFER_NUM, qQueueSize);
+        pipe_->InitBuffer(kInQueue_, BUFFER_NUM, kQueueSize);
+        pipe_->InitBuffer(aInQueue_, BUFFER_NUM, Ceil(HV_ * sizeof(inType), BLOCK));
+        pipe_->InitBuffer(bInQueue_, BUFFER_NUM, Ceil(HV_ * sizeof(inType), BLOCK));
+        pipe_->InitBuffer(tmpInQueue_, BUFFER_NUM, Ceil(hvAligned * sizeof(float), BLOCK));
+        pipe_->InitBuffer(vInQueue_, BUFFER_NUM, vQueueSize);
+        pipe_->InitBuffer(stateInQueue_, BUFFER_NUM, stateInQueueSize);
+        pipe_->InitBuffer(stateOutQueue_, BUFFER_NUM, stateOutQueueSize);
+        pipe_->InitBuffer(attnOutQueue_, BUFFER_NUM, attnOutQueueSize);
+
+        // UB working buffers (TBuf InitBuffer: (buf, size))
+        pipe_->InitBuffer(qInUb_, HK_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(kInUb_, HK_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(vInUb_, vStep_ * sizeof(float));
+        pipe_->InitBuffer(stateInUb_, vStep_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(broadTmpUb_, vStep_ * alignK_ * sizeof(float));
+        pipe_->InitBuffer(deltaUb_, vStep_ * sizeof(float));
+        pipe_->InitBuffer(attnUb_, vStep_ * sizeof(float));
+        pipe_->InitBuffer(gUb_, hvAligned * sizeof(float) + 64);
+        pipe_->InitBuffer(betaUb_, hvAligned * sizeof(float) + 64);
+        pipe_->InitBuffer(tmpUb_, tmpUbSize * sizeof(float));
     }
 
     __aicore__ inline void Process()
     {
-        return;
+        if (blockIdx >= GetBlockNum()) return;
+
+        for (uint64_t bi = blockIdx; bi < B_; bi += GetBlockNum()) {
+            int32_t stateIdx = ssmStateIndicesGm_.GetValue(bi);
+            if (stateIdx < 0) continue;
+
+            LoadQK(bi);
+            ComputeGBeta(bi);
+            PipeBarrier<PIPE_V>();
+
+            for (uint32_t hvi = 0; hvi < HV_; hvi++) {
+                ProcessHead(bi, hvi, stateIdx);
+            }
+        }
     }
 
 private:
@@ -111,6 +159,17 @@ private:
         if (alignK_ > DK_) {
             LocalTensor<float> qUb = qInUb_.Get<float>();
             LocalTensor<float> kUb = kInUb_.Get<float>();
+            // Cast writes contiguously at [h*DK_]; rearrange to aligned strides [h*alignK_]
+            // Process in reverse to avoid overwriting source data
+            for (int32_t h = static_cast<int32_t>(HK_) - 1; h >= 0; h--) {
+                uint32_t srcOff = static_cast<uint32_t>(h) * DK_;
+                uint32_t dstOff = static_cast<uint32_t>(h) * alignK_;
+                for (uint32_t i = DK_; i > 0; i--) {
+                    qUb.SetValue(dstOff + i - 1, qUb.GetValue(srcOff + i - 1));
+                    kUb.SetValue(dstOff + i - 1, kUb.GetValue(srcOff + i - 1));
+                }
+            }
+            // Zero-fill padding after valid data
             for (uint32_t h = 0; h < HK_; h++) {
                 Duplicate<float>(qUb[h * alignK_ + DK_], 0.0f, alignK_ - DK_);
                 Duplicate<float>(kUb[h * alignK_ + DK_], 0.0f, alignK_ - DK_);
@@ -130,8 +189,8 @@ private:
                     qSq += qv * qv;
                     kSq += kv * kv;
                 }
-                float qInvRms = 1.0f / sqrtf(qSq + eps);
-                float kInvRms = 1.0f / sqrtf(kSq + eps);
+                float qInvRms = 1.0f / sqrt(qSq + eps);
+                float kInvRms = 1.0f / sqrt(kSq + eps);
                 for (uint32_t i = 0; i < DK_; i++) {
                     qUb.SetValue(h * alignK_ + i,
                                  qUb.GetValue(h * alignK_ + i) * qInvRms);
@@ -153,7 +212,9 @@ private:
     {
         uint32_t hCnt = Ceil(HV_, FP32_NUM_PER_BLOCK) * FP32_NUM_PER_BLOCK;
         constexpr uint32_t BLOCK_SIZE = 32;
-        uint32_t alignedBytes = Ceil(HV_ * sizeof(inType), BLOCK_SIZE);
+        // Cast requires at least FP32_NUM_PER_BLOCK elements, ensure data copy covers that
+        uint32_t castCnt = (HV_ >= FP32_NUM_PER_BLOCK) ? HV_ : FP32_NUM_PER_BLOCK;
+        uint32_t abCopyBytes = castCnt * sizeof(inType);
         LocalTensor<float> gUb = gUb_.Get<float>();
         LocalTensor<float> betaUb = betaUb_.Get<float>();
         LocalTensor<float> tmp = tmpUb_.Get<float>();
@@ -163,65 +224,63 @@ private:
         Duplicate(tmp, 0.0f, hCnt);
         PipeBarrier<PIPE_V>();
 
-        // Load a via qInQueue_
+        // Load a and b via queues, cast directly to gUb/betaUb with padded count
         {
-            LocalTensor<inType> aLocal = qInQueue_.AllocTensor<inType>();
-            DataCopy(aLocal, aGm_[batchIdx * HV_], alignedBytes);
-            qInQueue_.EnQue(aLocal);
-            aLocal = qInQueue_.DeQue<inType>();
-            Cast(gUb, aLocal, RoundMode::CAST_NONE, HV_);
+            LocalTensor<inType> aLocal = aInQueue_.AllocTensor<inType>();
+            DataCopy(aLocal, aGm_[batchIdx * HV_], abCopyBytes);
+            aInQueue_.EnQue(aLocal);
+            aLocal = aInQueue_.DeQue<inType>();
+            Cast(gUb, aLocal, RoundMode::CAST_NONE, castCnt);
             PipeBarrier<PIPE_V>();
-            qInQueue_.FreeTensor(aLocal);
+            aInQueue_.FreeTensor(aLocal);
         }
-        // Load b via kInQueue_
         {
-            LocalTensor<inType> bLocal = kInQueue_.AllocTensor<inType>();
-            DataCopy(bLocal, bGm_[batchIdx * HV_], alignedBytes);
-            kInQueue_.EnQue(bLocal);
-            bLocal = kInQueue_.DeQue<inType>();
-            Cast(betaUb, bLocal, RoundMode::CAST_NONE, HV_);
+            LocalTensor<inType> bLocal = bInQueue_.AllocTensor<inType>();
+            DataCopy(bLocal, bGm_[batchIdx * HV_], abCopyBytes);
+            bInQueue_.EnQue(bLocal);
+            bLocal = bInQueue_.DeQue<inType>();
+            Cast(betaUb, bLocal, RoundMode::CAST_NONE, castCnt);
             PipeBarrier<PIPE_V>();
-            kInQueue_.FreeTensor(bLocal);
-        }
-
-        // Load dtBias via tmp (vectorized) and add to gUb
-        {
-            uint32_t dtAlignedBytes = Ceil(HV_ * sizeof(float), BLOCK_SIZE);
-            DataCopy(tmp, dtBiasGm_[0], dtAlignedBytes);
-            PipeBarrier<PIPE_V>();
-            Add(gUb, gUb, tmp, HV_);
+            bInQueue_.FreeTensor(bLocal);
         }
 
-        // Load aLog
-        {
-            uint32_t aLogAlignedBytes = Ceil(HV_ * sizeof(float), BLOCK_SIZE);
-            DataCopy(tmp, aLogGm_[batchIdx * HV_], aLogAlignedBytes);
-            PipeBarrier<PIPE_V>();
-            float savedALog = tmp.GetValue(0);
-            Duplicate(tmp, 0.0f, hCnt);
-            PipeBarrier<PIPE_V>();
-            tmp.SetValue(0, savedALog);
-            PipeBarrier<PIPE_V>();
+        // Load dtBias via scalar GM reads into TBuf (GlobalTensor<float>::GetValue)
+        for (uint32_t i = 0; i < HV_; i++) {
+            float dv = dtBiasGm_.GetValue(i);
+            gUb.SetValue(i, gUb.GetValue(i) + dv);
         }
+        PipeBarrier<PIPE_V>();
 
-        Exp(gUb, gUb, hCnt);
-        Adds(gUb, gUb, 1.0f, hCnt);
-        Log(gUb, gUb, hCnt);
+        // Load A_log via scalar GM reads into TBuf, then vector Exp
+        for (uint32_t i = 0; i < HV_; i++) {
+            tmp.SetValue(i, aLogGm_.GetValue(i));
+        }
+        PipeBarrier<PIPE_V>();
+        Exp(tmp, tmp, castCnt);
+        Muls(tmp, tmp, -1.0f, castCnt);
+        PipeBarrier<PIPE_V>();
 
-        Exp(tmp, tmp, hCnt);
-        Muls(tmp, tmp, -1.0f, hCnt);
+        // Compute exp_g: softplus(gUb) * (-exp(A_log)), then exp
+        Exp(gUb, gUb, castCnt);
+        Adds(gUb, gUb, 1.0f, castCnt);
+        Ln(gUb, gUb, castCnt);
 
-        Mul(gUb, gUb, tmp, hCnt);
-        Exp(gUb, gUb, hCnt);
+        // tmp = -exp(A_log), multiply with softplus result
+        Mul(gUb, gUb, tmp, castCnt);
+        Exp(gUb, gUb, castCnt);
 
-        Muls(betaUb, betaUb, -1.0f, hCnt);
-        Exp(betaUb, betaUb, hCnt);
-        Adds(betaUb, betaUb, 1.0f, hCnt);
-        Reciprocal(betaUb, betaUb, hCnt);
+        // Compute beta: sigmoid(betaUb)
+        Muls(betaUb, betaUb, -1.0f, castCnt);
+        Exp(betaUb, betaUb, castCnt);
+        Adds(betaUb, betaUb, 1.0f, castCnt);
+        Reciprocal(betaUb, betaUb, castCnt);
+        PipeBarrier<PIPE_V>();
+        PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void ProcessHead(uint64_t batchIdx, uint64_t hv, int32_t stateIdx)
     {
+        PipeBarrier<PIPE_V>();
         uint64_t hk = hv / numKVGroups_;
         float exp_g = gUb_.Get<float>().GetValue(hv);
         float betaVal = betaUb_.Get<float>().GetValue(hv);
@@ -233,6 +292,12 @@ private:
         LocalTensor<float> broadTmpUb = broadTmpUb_.Get<float>();
         LocalTensor<float> deltaUb = deltaUb_.Get<float>();
         LocalTensor<float> attnUb = attnUb_.Get<float>();
+
+        // Zero-initialize to avoid non-deterministic uninitialized data
+        Duplicate(broadTmpUb, 0.0f, vStep_ * alignK_);
+        Duplicate(deltaUb, 0.0f, vStep_);
+        Duplicate(attnUb, 0.0f, vStep_);
+        PipeBarrier<PIPE_V>();
 
         for (uint64_t v0 = 0; v0 < DV_; v0 += vStep_) {
             uint32_t curV = Std::min(vStep_, DV_ - v0);
@@ -249,9 +314,9 @@ private:
             MatVecMul(stateUb, kUb[hk * alignK_], broadTmpUb, curV, false);
             ReduceSumDispatch(deltaUb, broadTmpUb, curV);
 
-            Sub(deltaUb, vUb, deltaUb, curV);
-
-            Muls(deltaUb, deltaUb, betaVal, curV);
+            uint32_t curVPadded = (curV >= FP32_NUM_PER_BLOCK) ? curV : FP32_NUM_PER_BLOCK;
+            Sub(deltaUb, vUb, deltaUb, curVPadded);
+            Muls(deltaUb, deltaUb, betaVal, curVPadded);
 
             for (uint32_t vi = 0; vi < curV; vi++) {
                 Muls(broadTmpUb[vi * alignK_], kUb[hk * alignK_], deltaUb.GetValue(vi), alignK_);
@@ -265,6 +330,7 @@ private:
             WriteAttn(batchIdx, hv, v0, curV);
             WriteState(stateOff, curV);
         }
+        PipeBarrier<PIPE_V>();
     }
 
     __aicore__ inline void LoadVChunk(uint64_t batchIdx, uint64_t hv, uint64_t v0, uint32_t curV)
@@ -355,10 +421,12 @@ private:
                                      LocalTensor<float> &dstTensor, uint32_t cols, bool isAdd)
     {
         uint8_t repeatStride = alignK_ / FP32_NUM_PER_BLOCK;
+        // Pad cols to FP32_NUM_PER_BLOCK for reliable vector operation
+        uint32_t paddedCols = (cols >= FP32_NUM_PER_BLOCK) ? cols : FP32_NUM_PER_BLOCK;
         for (uint32_t i = 0; i < alignK_; i += REPEAT_LENTH) {
             uint64_t mask = Std::min(REPEAT_LENTH, alignK_ - i);
-            for (uint32_t j = 0; j < cols; j += MAX_REPEAT_TIME) {
-                uint64_t repeatTime = Std::min(MAX_REPEAT_TIME, cols - j);
+            for (uint32_t j = 0; j < paddedCols; j += MAX_REPEAT_TIME) {
+                uint64_t repeatTime = Std::min(MAX_REPEAT_TIME, paddedCols - j);
                 if (isAdd) {
                     MulAddDst(dstTensor[j * alignK_ + i], cubeTensor[j * alignK_ + i], vecTensor[i], mask, repeatTime,
                               {1, 1, 1, repeatStride, repeatStride, 0});
@@ -396,6 +464,7 @@ private:
     TBuf<TPosition::VECCALC> gUb_, betaUb_, tmpUb_;
 
     TQue<QuePosition::VECIN, BUFFER_NUM> qInQueue_, kInQueue_, vInQueue_;
+    TQue<QuePosition::VECIN, BUFFER_NUM> aInQueue_, bInQueue_, tmpInQueue_;
     TQue<QuePosition::VECIN, BUFFER_NUM> stateInQueue_;
     TQue<QuePosition::VECOUT, BUFFER_NUM> stateOutQueue_, attnOutQueue_;
 
