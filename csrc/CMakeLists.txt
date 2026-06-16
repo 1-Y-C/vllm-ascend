@@ -311,6 +311,8 @@ list(APPEND OP_DIR_LIST ${COMPILED_OP_DIRS})
 list(REMOVE_DUPLICATES OP_DIR_LIST)
 list(APPEND OP_LIST "fused_gdn_gating")
 list(APPEND OP_DIR_LIST ${CMAKE_CURRENT_SOURCE_DIR}/attention/fused_gdn_gating)
+list(APPEND OP_LIST "fused_rgdr_packed_decode")
+list(APPEND OP_DIR_LIST ${CMAKE_CURRENT_SOURCE_DIR}/attention/fused_rgdr_packed_decode)
 
 set(OP_DEPEND_DIR_LIST)
 op_add_depend_directory(

@@ -716,6 +716,25 @@ std::tuple<at::Tensor, at::Tensor> npu_fused_gdn_gating_meta(
     return std::make_tuple(g, beta_output);
 }
 
+at::Tensor npu_fused_rgdr_packed_decode_meta(
+    const at::Tensor& mixed_qkv,
+    const at::Tensor& a,
+    const at::Tensor& b,
+    const at::Tensor& a_log,
+    const at::Tensor& dt_bias,
+    const at::Tensor& state,
+    const at::Tensor& ssm_state_indices,
+    c10::optional<double> scale)
+{
+    int64_t B = mixed_qkv.size(0);
+    int64_t HV = a.size(1);
+    int64_t DV = state.size(2);
+
+    auto options = mixed_qkv.options().dtype(at::ScalarType::BFloat16);
+    at::Tensor output = at::empty_symint({B, 1, HV, DV}, options);
+    return output;
+}
+
 std::vector<at::Tensor> moe_grouped_matmul_meta(
     at::Tensor x,
     at::Tensor weight,
@@ -1739,6 +1758,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("store_kv_block", &vllm_ascend::meta::store_kv_block);
     // npu_fused_gdn_gating
     ops.impl("npu_fused_gdn_gating", &vllm_ascend::meta::npu_fused_gdn_gating_meta);
+    // npu_fused_rgdr_packed_decode
+    ops.impl("npu_fused_rgdr_packed_decode", &vllm_ascend::meta::npu_fused_rgdr_packed_decode_meta);
 }
 }
 #endif
