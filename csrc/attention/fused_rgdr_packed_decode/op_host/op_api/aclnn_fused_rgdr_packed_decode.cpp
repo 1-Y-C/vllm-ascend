@@ -12,6 +12,7 @@
 #include "aclnn_kernels/common/op_error_check.h"
 #include "opdev/common_types.h"
 #include "opdev/op_dfx.h"
+#include "opdev/make_op_executor.h"
 #include "opdev/op_executor.h"
 #include "opdev/op_log.h"
 #include "opdev/platform.h"
@@ -100,16 +101,19 @@ aclnnStatus aclnnFusedRgdrPackedDecodeGetWorkspaceSize(
     auto bContig    = l0op::Contiguous(b,               uniqueExecutor.get());
     auto al    = l0op::Contiguous(aLog,            uniqueExecutor.get());
     auto db    = l0op::Contiguous(dtBias,          uniqueExecutor.get());
-    auto si    = l0op::Contiguous(ssmStateIndices, uniqueExecutor.get());
+    auto stContig = l0op::Contiguous(stateRef,        uniqueExecutor.get());
+    auto si       = l0op::Contiguous(ssmStateIndices, uniqueExecutor.get());
     CHECK_RET(mq != nullptr && aContig != nullptr && bContig != nullptr, ACLNN_ERR_INNER_NULLPTR);
-    CHECK_RET(al != nullptr && db != nullptr && si != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    CHECK_RET(al != nullptr && db != nullptr && stContig != nullptr && si != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
-    auto result = l0op::FusedRgdrPackedDecode(mq, aContig, bContig, al, db, stateRef, si,
+    auto result = l0op::FusedRgdrPackedDecode(mq, aContig, bContig, al, db, stContig, si,
                                               scaleValue, uniqueExecutor.get());
-    CHECK_RET(result.out != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    CHECK_RET(result.out != nullptr && result.stateOut != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
     auto vc = l0op::ViewCopy(result.out, out, uniqueExecutor.get());
     CHECK_RET(vc != nullptr, ACLNN_ERR_INNER_NULLPTR);
+    auto vcSt = l0op::ViewCopy(result.stateOut, stateRef, uniqueExecutor.get());
+    CHECK_RET(vcSt != nullptr, ACLNN_ERR_INNER_NULLPTR);
 
     *workspaceSize = uniqueExecutor->GetWorkspaceSize();
     uniqueExecutor.ReleaseTo(executor);

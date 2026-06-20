@@ -110,7 +110,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
     pipe_->InitBuffer(cGate,  4 * HV * sizeof(float) + SIGMOID_TMP_BYTES);
     pipe_->InitBuffer(cBeta,  HV * sizeof(float));
 
-    LocalTensor<float> qB  = cQ.Get<float>(HK * dkA);
+    LocalTensor<float> qtB = cQ.Get<float>(HK * dkA);
     LocalTensor<float> kB  = cK.Get<float>(HK * dkA);
     LocalTensor<float> vB  = cV.Get<float>(HV * dvA);
     LocalTensor<float> stB = cSt.Get<float>(dvA * dkA);
@@ -132,7 +132,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         int32_t sid;
         {
             LocalTensor<int32_t> ib = qSid.AllocTensor<int32_t>();
-            DataCopyParams cp = {1, 1, 0, 0};
+            DataCopyExtParams cp ={1, (uint16_t)sizeof(int32_t), 0, 0, 0};
             DataCopyPad(ib, siGm_[bi], cp, {false, 0, 0, 0});
             qSid.EnQue(ib);
             ib = qSid.DeQue<int32_t>();
@@ -147,7 +147,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                 Duplicate<bfloat16_t>(ow, 0, dvA);
                 qOut.EnQue(ow);
                 ow = qOut.DeQue<bfloat16_t>();
-                DataCopyParams cp = {1, (uint16_t)(dvA * sizeof(bfloat16_t)), 0, 0};
+                DataCopyExtParams cp ={1, (uint16_t)(dvA * sizeof(bfloat16_t)), 0, 0, 0};
                 DataCopyPad(outGm_[bi * HV * DV + hvi * DV], ow, cp);
                 qOut.FreeTensor(ow);
             }
@@ -165,7 +165,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                     }
                     qStWr.EnQue(ch);
                     ch = qStWr.DeQue<S>();
-                    DataCopyParams cp = {1, (uint16_t)(c * sizeof(S)), 0, 0};
+                    DataCopyExtParams cp ={1, (uint16_t)(c * sizeof(S)), 0, 0, 0};
                     DataCopyPad(stoGm_[sOff + o], ch, cp);
                     qStWr.FreeTensor(ch);
                 }
@@ -176,12 +176,12 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         // --- Step 1 UNPACK ---
         {
             LocalTensor<bfloat16_t> mx = qMq.AllocTensor<bfloat16_t>();
-            DataCopyParams cp = {1, (uint16_t)(L * sizeof(bfloat16_t)), 0, 0};
+            DataCopyExtParams cp ={1, (uint16_t)(L * sizeof(bfloat16_t)), 0, 0, 0};
             DataCopyPad(mx, mqGm_[bi * L], cp, {false, 0, 0, 0});
             qMq.EnQue(mx);
             mx = qMq.DeQue<bfloat16_t>();
             uint32_t qO = 0, kO = HK * DK, vO = 2 * HK * DK;
-            Cast<float, bfloat16_t>(qB, mx[qO], RoundMode::CAST_NONE, HK * DK);
+            Cast<float, bfloat16_t>(qtB, mx[qO], RoundMode::CAST_NONE, HK * DK);
             Cast<float, bfloat16_t>(kB, mx[kO], RoundMode::CAST_NONE, HK * DK);
             Cast<float, bfloat16_t>(vB, mx[vO], RoundMode::CAST_NONE, HV * DV);
             qMq.FreeTensor(mx);
@@ -190,13 +190,13 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         // --- Step 2 L2NORM Q ---
         PipeBarrier<PIPE_V>();
         for (uint32_t h = 0; h < HK; ++h) {
-            Mul(sq, qB[h * dkA], qB[h * dkA], DK);
+            Mul(sq, qtB[h * dkA], qtB[h * dkA], DK);
             ReduceSum<float>(sr, sq, rdT, (int32_t)DK);
             PipeBarrier<PIPE_V>();
             Adds(sr, sr, ep, 1);
             Rsqrt(sr, sr, 1);
             PipeBarrier<PIPE_V>();
-            Muls(qB[h * dkA], qB[h * dkA], sr.GetValue(0), DK);
+            Muls(qtB[h * dkA], qtB[h * dkA], sr.GetValue(0), DK);
         }
         // --- Step 2 L2NORM K ---
         for (uint32_t h = 0; h < HK; ++h) {
@@ -211,13 +211,13 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
 
         // --- Step 3 SCALE ---
         for (uint32_t h = 0; h < HK; ++h) {
-            Muls(qB[h * dkA], qB[h * dkA], scaleVal, DK);
+            Muls(qtB[h * dkA], qtB[h * dkA], scaleVal, DK);
         }
 
         // --- Step 4 GATE ---
         {
             LocalTensor<float> alL = qAl.AllocTensor<float>();
-            DataCopyParams cp = {1, (uint16_t)(HV * sizeof(float)), 0, 0};
+            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
             DataCopyPad(alL, alGm_, cp, {false, 0, 0, 0});
             qAl.EnQue(alL);
             alL = qAl.DeQue<float>();
@@ -229,7 +229,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         Muls(eG, eG, -1.0f, HV);
         {
             LocalTensor<bfloat16_t> aL = qA.AllocTensor<bfloat16_t>();
-            DataCopyParams cp = {1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0};
+            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
             DataCopyPad(aL, aGm_[bi * HV], cp, {false, 0, 0, 0});
             qA.EnQue(aL);
             aL = qA.DeQue<bfloat16_t>();
@@ -238,7 +238,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         }
         {
             LocalTensor<float> dL = qDb.AllocTensor<float>();
-            DataCopyParams cp = {1, (uint16_t)(HV * sizeof(float)), 0, 0};
+            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
             DataCopyPad(dL, dbGm_, cp, {false, 0, 0, 0});
             qDb.EnQue(dL);
             dL = qDb.DeQue<float>();
@@ -255,7 +255,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         // --- Step 5 BETA ---
         {
             LocalTensor<bfloat16_t> bL = qB.AllocTensor<bfloat16_t>();
-            DataCopyParams cp = {1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0};
+            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
             DataCopyPad(bL, bGm_[bi * HV], cp, {false, 0, 0, 0});
             qB.EnQue(bL);
             bL = qB.DeQue<bfloat16_t>();
@@ -276,7 +276,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
             for (uint32_t o = 0; o < tot; o += ST_CHUNK_ELEMS) {
                 uint32_t c = (o + ST_CHUNK_ELEMS <= tot) ? ST_CHUNK_ELEMS : (tot - o);
                 LocalTensor<S> ch = qStRd.AllocTensor<S>();
-                DataCopyParams cp = {1, (uint16_t)(c * sizeof(S)), 0, 0};
+                DataCopyExtParams cp ={1, (uint16_t)(c * sizeof(S)), 0, 0, 0};
                 DataCopyPad(ch, stGm_[sOff + o], cp, {false, 0, 0, 0});
                 qStRd.EnQue(ch);
                 ch = qStRd.DeQue<S>();
@@ -324,7 +324,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
             PipeBarrier<PIPE_V>();
 
             for (uint32_t dvi = 0; dvi < DV; ++dvi) {
-                Mul(tr, stB[dvi * dkA], qB[hki * dkA], DK);
+                Mul(tr, stB[dvi * dkA], qtB[hki * dkA], DK);
                 ReduceSum<float>(sr, tr, rdT, (int32_t)DK);
                 PipeBarrier<PIPE_V>();
                 oB.SetValue(dvi, sr.GetValue(0));
@@ -336,7 +336,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                 Cast<bfloat16_t, float>(ow, oB, RoundMode::CAST_RINT, DV);
                 qOut.EnQue(ow);
                 ow = qOut.DeQue<bfloat16_t>();
-                DataCopyParams cp = {1, (uint16_t)(DV * sizeof(bfloat16_t)), 0, 0};
+                DataCopyExtParams cp ={1, (uint16_t)(DV * sizeof(bfloat16_t)), 0, 0, 0};
                 DataCopyPad(outGm_[bi * HV * DV + hvi * DV], ow, cp);
                 qOut.FreeTensor(ow);
             }
@@ -351,7 +351,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                 }
                 qStWr.EnQue(ch);
                 ch = qStWr.DeQue<S>();
-                DataCopyParams cp = {1, (uint16_t)(c * sizeof(S)), 0, 0};
+                DataCopyExtParams cp ={1, (uint16_t)(c * sizeof(S)), 0, 0, 0};
                 DataCopyPad(stoGm_[sOff + o], ch, cp);
                 qStWr.FreeTensor(ch);
             }
@@ -359,7 +359,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         }
     }
 
-    cQ.FreeTensor(qB); cK.FreeTensor(kB); cV.FreeTensor(vB); cSt.FreeTensor(stB);
+    cQ.FreeTensor(qtB); cK.FreeTensor(kB); cV.FreeTensor(vB); cSt.FreeTensor(stB);
     cSqBuf.FreeTensor(sq); cScBuf.FreeTensor(sr); cRd.FreeTensor(rdT);
     cOutFp32.FreeTensor(oB); cTmp.FreeTensor(tr);
     cGate.FreeTensor(alT); cGate.FreeTensor(aT); cGate.FreeTensor(sT);

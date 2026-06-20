@@ -144,47 +144,12 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         git checkout "${CATLASS_COMMIT}" || exit 1
         cd - || exit 1
     fi
+    ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
+    export CPATH="${ABSOLUTE_CATLASS_PATH}${CPATH:+:${CPATH}}"
+    log "catlass include=${ABSOLUTE_CATLASS_PATH}"
+
     CUSTOM_OPS_ARRAY=(
-        "scatter_nd_update_v2"
-        "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
-        "lightning_indexer"
-        "sparse_flash_attention"
-        "dispatch_ffn_combine"
-        "dispatch_ffn_combine_w4_a8"
-        "dispatch_ffn_combine_bf16"
-        "dispatch_gmm_combine_decode"
-        "moe_init_routing_custom"
-        "moe_gating_top_k"
-        "moe_gating_top_k_hash"
-        "add_rms_norm_bias"
-        "apply_top_k_top_p_custom"
-        "transpose_kv_cache_by_block"
-        "copy_and_expand_eagle_inputs"
-        "causal_conv1d"
-        "moe_grouped_matmul"
-        "lightning_indexer_quant"
-        "compressor"
-        "quant_lightning_indexer"
-        "quant_lightning_indexer_metadata"
-        "sparse_attn_sharedkv"
-        "sparse_attn_sharedkv_metadata"
-        "hc_pre_sinkhorn"
-        "hc_pre_inv_rms"
-        "hc_pre"
-        "hc_post"
-        "inplace_partial_rotary_mul"
-        "rms_norm_dynamic_quant"
-        "dequant_swiglu_quant"
-        "grouped_matmul_swiglu_quant"
-        "grouped_matmul_swiglu_quant_v2"
-        "hamming_dist_top_k"
-        "reshape_and_cache_bnsd"
-        "recurrent_gated_delta_rule"
-        "fused_gdn_gating"
-        "ngram_spec_decode"
-        "chunk_fwd_o"
-        "chunk_gated_delta_rule_fwd_h"
-        "store_kv_block"
+        "fused_rgdr_packed_decode"
     )
     CUSTOM_OPS=$(IFS=';'; echo "${CUSTOM_OPS_ARRAY[*]}")
     SOC_ARG="ascend910_93"
@@ -275,6 +240,15 @@ log_selected_ops
   log "building custom ops ${CUSTOM_OPS} for ${SOC_VERSION}"
   bash build.sh --pkg --ops="${CUSTOM_OPS}" --soc="${SOC_ARG}"
   log "build.sh finished"
+
+  # Workaround: op_build generates .ini files using canonical SoC names (ascend910b for arch32),
+  # but ops-info.json expects the actual SoC name (ascend910_93). Create symlinks if needed.
+  for ini_dir in "${ROOT_DIR}/csrc/build/autogen" "${ROOT_DIR}/csrc/build/autogen/exc" "${ROOT_DIR}/csrc/build/autogen/inner"; do
+      if [[ -f "${ini_dir}/aic-ascend910b-ops-info.ini" ]] && [[ ! -f "${ini_dir}/aic-ascend910_93-ops-info.ini" ]]; then
+          ln -sf aic-ascend910b-ops-info.ini "${ini_dir}/aic-ascend910_93-ops-info.ini"
+          log "created symlink: ${ini_dir}/aic-ascend910_93-ops-info.ini -> aic-ascend910b-ops-info.ini"
+      fi
+  done
 
   custom_ops_install_dir="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"
   log "custom_ops_install_dir=${custom_ops_install_dir}"

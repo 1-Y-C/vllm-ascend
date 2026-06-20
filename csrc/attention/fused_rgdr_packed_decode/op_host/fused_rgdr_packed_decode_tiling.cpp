@@ -5,16 +5,15 @@
  */
 
 #include "fused_rgdr_packed_decode_tiling.h"
-#include "register/op_def_registry.h"
+#include "register/op_impl_registry.h"
 #include "op_common/log/log.h"
 #include "platform/platform_info.h"
-#include "../../op_kernel/fused_rgdr_packed_decode_tiling_data.h"
+#include "tiling/platform/platform_ascendc.h"
+#include "../op_kernel/fused_rgdr_packed_decode_tiling_data.h"
 #include <cmath>
 #include <dlfcn.h>
 
 namespace optiling {
-
-using Ops::Base::CeilDiv;
 
 constexpr size_t WORKSPACE_NUM = 1;
 
@@ -89,7 +88,7 @@ ge::graphStatus FusedRgdrPackedDecodeTilingFunc(gert::TilingContext* context)
         currentWorkspace[0] = 0;
     }
 
-    ASCENDC_TPL_SEL_PARAM(context, 1);  // TilingKey = 1 for float state
+    context->SetTilingKey(1);  // TilingKey = 1 for float state
 
     auto tiling = context->GetTilingData<FusedRgdrPackedDecodeTilingData>();
     if (tiling == nullptr) {

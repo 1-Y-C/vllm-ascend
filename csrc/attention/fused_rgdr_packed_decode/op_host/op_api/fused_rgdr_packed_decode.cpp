@@ -19,12 +19,12 @@ namespace l0op {
 
 OP_TYPE_REGISTER(FusedRgdrPackedDecode);
 
-static constexpr FusedRgdrPackedDecodeOutput kNullOutput{nullptr};
+static constexpr FusedRgdrPackedDecodeOutput kNullOutput{nullptr, nullptr};
 
 FusedRgdrPackedDecodeOutput FusedRgdrPackedDecode(
     const aclTensor *mixedQkv, const aclTensor *a, const aclTensor *b,
     const aclTensor *aLog, const aclTensor *dtBias,
-    aclTensor *stateRef, const aclTensor *ssmStateIndices,
+    const aclTensor *stateRef, const aclTensor *ssmStateIndices,
     float scaleValue, aclOpExecutor *executor)
 {
     L0_DFX(FusedRgdrPackedDecode, mixedQkv, a, b, aLog, dtBias, stateRef, ssmStateIndices, scaleValue);
@@ -36,21 +36,26 @@ FusedRgdrPackedDecodeOutput FusedRgdrPackedDecode(
     OP_CHECK(out != nullptr, OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "out AllocTensor failed."),
              return kNullOutput);
 
+    auto sDtype = stateRef->GetDataType();
+    auto stateOut = executor->AllocTensor(sDtype, format, format);
+    OP_CHECK(stateOut != nullptr, OP_LOGE(ACLNN_ERR_INNER_NULLPTR, "stateOut AllocTensor failed."),
+             return kNullOutput);
+
     auto ret = INFER_SHAPE(FusedRgdrPackedDecode,
                            OP_INPUT(mixedQkv, a, b, aLog, dtBias, stateRef, ssmStateIndices),
-                           OP_OUTPUT(out, stateRef),
+                           OP_OUTPUT(out, stateOut),
                            OP_ATTR(scaleValue));
     OP_CHECK_INFERSHAPE(ret != ACLNN_SUCCESS, return kNullOutput,
                         "FusedRgdrPackedDecode InferShape failed.");
 
     ret = ADD_TO_LAUNCHER_LIST_AICORE(FusedRgdrPackedDecode,
                                       OP_INPUT(mixedQkv, a, b, aLog, dtBias, stateRef, ssmStateIndices),
-                                      OP_OUTPUT(out, stateRef),
+                                      OP_OUTPUT(out, stateOut),
                                       OP_ATTR(scaleValue));
     OP_CHECK_ADD_TO_LAUNCHER_LIST_AICORE(ret != ACLNN_SUCCESS, return kNullOutput,
         "FusedRgdrPackedDecode ADD_TO_LAUNCHER_LIST_AICORE failed.");
 
-    return FusedRgdrPackedDecodeOutput{out};
+    return FusedRgdrPackedDecodeOutput{out, stateOut};
 }
 
 } // namespace l0op

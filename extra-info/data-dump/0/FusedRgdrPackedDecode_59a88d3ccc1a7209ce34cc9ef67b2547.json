@@ -1,0 +1,170 @@
+{
+ "binFileName": "FusedRgdrPackedDecode_59a88d3ccc1a7209ce34cc9ef67b2547",
+ "binFileSuffix": ".o",
+ "blockDim": -1,
+ "coreType": "VectorCore",
+ "core_type": "AIV",
+ "intercoreSync": 0,
+ "kernelName": "FusedRgdrPackedDecode_59a88d3ccc1a7209ce34cc9ef67b2547",
+ "magic": "RT_DEV_BINARY_MAGIC_ELF_AIVEC",
+ "memoryStamping": [],
+ "opParaSize": 60,
+ "parameters": [
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null,
+  null
+ ],
+ "sha256": "460a53e32404feea70c07bb4ede1b289d16033cfa7235f4b5a99373c1f5b00e2",
+ "workspace": {
+  "num": 1,
+  "size": [
+   -1
+  ],
+  "type": [
+   0
+  ]
+ },
+ "kernelList": [
+  {
+   "kernelName": "FusedRgdrPackedDecode_59a88d3ccc1a7209ce34cc9ef67b2547_1"
+  }
+ ],
+ "optionalInputMode": "gen_placeholder",
+ "optionalOutputMode": "gen_placeholder",
+ "supportSuperKernel": 1,
+ "compileInfo": {},
+ "supportInfo": {
+  "implMode": "high_performance",
+  "int64Mode": false,
+  "simplifiedKeyMode": 0,
+  "simplifiedKey": [
+   "FusedRgdrPackedDecode/d=0,p=1/27,2/27,2/27,2/0,2/0,2/0,2/3,2/27,2/0,2",
+   "FusedRgdrPackedDecode/d=0,p=0/27,2/27,2/27,2/0,2/0,2/0,2/3,2/27,2/0,2",
+   "FusedRgdrPackedDecode/d=1,p=1/27,2/27,2/27,2/0,2/0,2/0,2/3,2/27,2/0,2",
+   "FusedRgdrPackedDecode/d=1,p=0/27,2/27,2/27,2/0,2/0,2/0,2/3,2/27,2/0,2"
+  ],
+  "optionalInputMode": "gen_placeholder",
+  "optionalOutputMode": "gen_placeholder",
+  "staticKey": "8fa1b84e42f667e5e8155628383a28e8a59cb330e79cb341e850b3f984b15430,97c51555364b4ab405619d381393a8af6df569357e7e8a7c5cec150b383c8aa8",
+  "inputs": [
+   {
+    "name": "mixed_qkv",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "a",
+    "index": 1,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "b",
+    "index": 2,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "a_log",
+    "index": 3,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "dt_bias",
+    "index": 4,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "state",
+    "index": 5,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "ssm_state_indices",
+    "index": 6,
+    "dtype": "int32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "outputs": [
+   {
+    "name": "out",
+    "index": 0,
+    "dtype": "bfloat16",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   },
+   {
+    "name": "state_out",
+    "index": 1,
+    "dtype": "float32",
+    "format": "ND",
+    "paramType": "required",
+    "shape": [
+     -2
+    ],
+    "format_match_mode": "FormatAgnostic"
+   }
+  ],
+  "attrs": [
+   {
+    "name": "scale_value",
+    "dtype": "float",
+    "value": 0.0
+   }
+  ],
+  "opMode": "dynamic",
+  "deterministic": "ignore"
+ },
+ "filePath": "ascend910_93/bin/fused_rgdr_packed_decode/FusedRgdrPackedDecode_59a88d3ccc1a7209ce34cc9ef67b2547.json"
+}

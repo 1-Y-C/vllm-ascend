@@ -722,7 +722,7 @@ at::Tensor npu_fused_rgdr_packed_decode_meta(
     const at::Tensor& b,
     const at::Tensor& a_log,
     const at::Tensor& dt_bias,
-    const at::Tensor& state,
+    at::Tensor& state,
     const at::Tensor& ssm_state_indices,
     c10::optional<double> scale)
 {

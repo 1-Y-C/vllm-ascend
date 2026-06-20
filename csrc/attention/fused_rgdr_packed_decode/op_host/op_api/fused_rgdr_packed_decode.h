@@ -12,13 +12,14 @@
 namespace l0op {
 
 struct FusedRgdrPackedDecodeOutput {
-    aclTensor *out{nullptr};
+    const aclTensor *out{nullptr};
+    const aclTensor *stateOut{nullptr};
 };
 
 FusedRgdrPackedDecodeOutput FusedRgdrPackedDecode(
     const aclTensor *mixedQkv, const aclTensor *a, const aclTensor *b,
     const aclTensor *aLog, const aclTensor *dtBias,
-    aclTensor *stateRef, const aclTensor *ssmStateIndices,
+    const aclTensor *stateRef, const aclTensor *ssmStateIndices,
     float scaleValue, aclOpExecutor *executor);
 
 } // namespace l0op
