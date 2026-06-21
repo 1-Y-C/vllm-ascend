@@ -66,7 +66,7 @@ public:
             .NeedCheckSupportFlag(false)
             .ExtendCfgInfo("softsync.flag", "true");
         this->AICore().AddConfig("ascend910b", aicConfig);
-        this->AICore().AddConfig("ascend950", aicConfig);
+        this->AICore().AddConfig("ascend910_93", aicConfig);
     }
 };
 

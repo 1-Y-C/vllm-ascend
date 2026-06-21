@@ -144,10 +144,6 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         git checkout "${CATLASS_COMMIT}" || exit 1
         cd - || exit 1
     fi
-    ABSOLUTE_CATLASS_PATH=$(cd "${CATLASS_PATH}" && pwd)
-    export CPATH="${ABSOLUTE_CATLASS_PATH}${CPATH:+:${CPATH}}"
-    log "catlass include=${ABSOLUTE_CATLASS_PATH}"
-
     CUSTOM_OPS_ARRAY=(
         "fused_rgdr_packed_decode"
     )
@@ -240,15 +236,6 @@ log_selected_ops
   log "building custom ops ${CUSTOM_OPS} for ${SOC_VERSION}"
   bash build.sh --pkg --ops="${CUSTOM_OPS}" --soc="${SOC_ARG}"
   log "build.sh finished"
-
-  # Workaround: op_build generates .ini files using canonical SoC names (ascend910b for arch32),
-  # but ops-info.json expects the actual SoC name (ascend910_93). Create symlinks if needed.
-  for ini_dir in "${ROOT_DIR}/csrc/build/autogen" "${ROOT_DIR}/csrc/build/autogen/exc" "${ROOT_DIR}/csrc/build/autogen/inner"; do
-      if [[ -f "${ini_dir}/aic-ascend910b-ops-info.ini" ]] && [[ ! -f "${ini_dir}/aic-ascend910_93-ops-info.ini" ]]; then
-          ln -sf aic-ascend910b-ops-info.ini "${ini_dir}/aic-ascend910_93-ops-info.ini"
-          log "created symlink: ${ini_dir}/aic-ascend910_93-ops-info.ini -> aic-ascend910b-ops-info.ini"
-      fi
-  done
 
   custom_ops_install_dir="${ROOT_DIR}/vllm_ascend/_cann_ops_custom"
   log "custom_ops_install_dir=${custom_ops_install_dir}"

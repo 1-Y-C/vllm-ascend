@@ -26,6 +26,7 @@ constexpr uint32_t ST_CHUNK_BYTES = ST_CHUNK_ELEMS * sizeof(float);
 constexpr uint32_t REDUCE_TMP_BYTES = 512U;
 constexpr uint32_t SIGMOID_TMP_BYTES = 256U;
 constexpr uint32_t BUFFER_NUM = 1;
+constexpr uint32_t MIN_BUF = 32U;
 
 template <typename S>
 class KernelFusedRgd {
@@ -65,6 +66,7 @@ __aicore__ inline void KernelFusedRgd<S>::Init(
     outGm_.SetGlobalBuffer((__gm__ bfloat16_t*)o, td_.B * 1 * HV * DV);
 }
 
+
 template<typename S>
 __aicore__ inline void KernelFusedRgd<S>::Process() {
     if (td_.B == 0) return;
@@ -86,16 +88,16 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
 
     pipe_->InitBuffer(qSid,  BUFFER_NUM, 32U);
     pipe_->InitBuffer(qMq,   BUFFER_NUM, L * sizeof(bfloat16_t));
-    pipe_->InitBuffer(qA,    BUFFER_NUM, HV * sizeof(bfloat16_t));
-    pipe_->InitBuffer(qB,    BUFFER_NUM, HV * sizeof(bfloat16_t));
-    pipe_->InitBuffer(qAl,   BUFFER_NUM, HV * sizeof(float));
-    pipe_->InitBuffer(qDb,   BUFFER_NUM, HV * sizeof(float));
+    pipe_->InitBuffer(qA,    BUFFER_NUM, (HV * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (HV * sizeof(bfloat16_t)));
+    pipe_->InitBuffer(qB,    BUFFER_NUM, (HV * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (HV * sizeof(bfloat16_t)));
+    pipe_->InitBuffer(qAl,   BUFFER_NUM, (HV * sizeof(float)      < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(qDb,   BUFFER_NUM, (HV * sizeof(float)      < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
     pipe_->InitBuffer(qStRd, BUFFER_NUM, ST_CHUNK_BYTES);
     pipe_->InitBuffer(qStWr, BUFFER_NUM, ST_CHUNK_BYTES);
-    pipe_->InitBuffer(qOut,  BUFFER_NUM, dvA * sizeof(bfloat16_t));
+    pipe_->InitBuffer(qOut,  BUFFER_NUM, (dvA * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (dvA * sizeof(bfloat16_t)));
 
     // --- Compute buffers (VECCALC) ---
-    TBuf<TPosition::VECCALC> cQ, cK, cV, cSt, cRd, cOutFp32, cTmp, cGate, cBeta;
+    TBuf<TPosition::VECCALC> cQ, cK, cV, cSt, cRd, cOutFp32, cTmp, cGateAl, cGateA, cGateS, cGateE, cGateSg, cBeta;
     TBuf<TPosition::VECCALC> cSqBuf, cScBuf;
 
     pipe_->InitBuffer(cQ,     HK * dkA * sizeof(float));
@@ -105,10 +107,14 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
     pipe_->InitBuffer(cRd,    REDUCE_TMP_BYTES);
     pipe_->InitBuffer(cOutFp32, dvA * sizeof(float));
     pipe_->InitBuffer(cSqBuf, dkA * sizeof(float));
-    pipe_->InitBuffer(cScBuf, 8 * sizeof(float));
+    pipe_->InitBuffer(cScBuf, 32U);
     pipe_->InitBuffer(cTmp,   dkA * sizeof(float));
-    pipe_->InitBuffer(cGate,  4 * HV * sizeof(float) + SIGMOID_TMP_BYTES);
-    pipe_->InitBuffer(cBeta,  HV * sizeof(float));
+    pipe_->InitBuffer(cGateAl, (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateA,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateS,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateE,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateSg, SIGMOID_TMP_BYTES);
+    pipe_->InitBuffer(cBeta,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
 
     LocalTensor<float> qtB = cQ.Get<float>(HK * dkA);
     LocalTensor<float> kB  = cK.Get<float>(HK * dkA);
@@ -120,11 +126,11 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
     LocalTensor<float> oB  = cOutFp32.Get<float>(dvA);
     LocalTensor<float> tr  = cTmp.Get<float>(dkA);
 
-    LocalTensor<float>    alT = cGate.Get<float>(HV);
-    LocalTensor<float>    aT  = cGate.GetWithOffset<float>(1 * HV * sizeof(float), HV);
-    LocalTensor<float>    sT  = cGate.GetWithOffset<float>(2 * HV * sizeof(float), HV);
-    LocalTensor<float>    eG  = cGate.GetWithOffset<float>(3 * HV * sizeof(float), HV);
-    LocalTensor<uint8_t>  sgT = cGate.GetWithOffset<uint8_t>(4 * HV * sizeof(float), SIGMOID_TMP_BYTES);
+    LocalTensor<float>    alT = cGateAl.Get<float>(HV);
+    LocalTensor<float>    aT  = cGateA.Get<float>(HV);
+    LocalTensor<float>    sT  = cGateS.Get<float>(HV);
+    LocalTensor<float>    eG  = cGateE.Get<float>(HV);
+    LocalTensor<uint8_t>  sgT = cGateSg.Get<uint8_t>(SIGMOID_TMP_BYTES);
     LocalTensor<float>    beB = cBeta.Get<float>(HV);
 
     for (uint32_t bi = bs; bi < be; ++bi) {
@@ -140,7 +146,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
             qSid.FreeTensor(ib);
         }
 
-        // --- Skip branch ---
+        // --- Skip branch (output zeros, no state write) ---
         if (sid < 0) {
             for (uint32_t hvi = 0; hvi < HV; ++hvi) {
                 LocalTensor<bfloat16_t> ow = qOut.AllocTensor<bfloat16_t>();
@@ -150,25 +156,6 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                 DataCopyExtParams cp ={1, (uint16_t)(dvA * sizeof(bfloat16_t)), 0, 0, 0};
                 DataCopyPad(outGm_[bi * HV * DV + hvi * DV], ow, cp);
                 qOut.FreeTensor(ow);
-            }
-            Duplicate<float>(stB, 0.0f, DV * DK);
-            PipeBarrier<PIPE_V>();
-            for (uint32_t hvi = 0; hvi < HV; ++hvi) {
-                uint32_t sOff = ((uint32_t)0 * HV + hvi) * DV * DK;
-                for (uint32_t o = 0; o < DV * DK; o += ST_CHUNK_ELEMS) {
-                    uint32_t c = (o + ST_CHUNK_ELEMS <= DV * DK) ? ST_CHUNK_ELEMS : (DV * DK - o);
-                    LocalTensor<S> ch = qStWr.AllocTensor<S>();
-                    if constexpr (std::is_same<S, float>::value) {
-                        DataCopy(ch, stB[o], c);
-                    } else {
-                        Cast(ch, stB[o], RoundMode::CAST_RINT, c);
-                    }
-                    qStWr.EnQue(ch);
-                    ch = qStWr.DeQue<S>();
-                    DataCopyExtParams cp ={1, (uint16_t)(c * sizeof(S)), 0, 0, 0};
-                    DataCopyPad(stoGm_[sOff + o], ch, cp);
-                    qStWr.FreeTensor(ch);
-                }
             }
             continue;
         }
@@ -221,12 +208,11 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
             DataCopyPad(alL, alGm_, cp, {false, 0, 0, 0});
             qAl.EnQue(alL);
             alL = qAl.DeQue<float>();
-            DataCopy(alT, alL, HV);
+            Exp(eG, alL, HV);
+            Muls(eG, eG, -1.0f, HV);
             qAl.FreeTensor(alL);
         }
         PipeBarrier<PIPE_V>();
-        Exp(eG, alT, HV);
-        Muls(eG, eG, -1.0f, HV);
         {
             LocalTensor<bfloat16_t> aL = qA.AllocTensor<bfloat16_t>();
             DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
@@ -267,7 +253,6 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
         PipeBarrier<PIPE_MTE3>();
 
         // --- Step 6+7 RECURRENCE + OUTPUT ---
-        PipeBarrier<PIPE_ALL>();
         for (uint32_t hvi = 0; hvi < HV; ++hvi) {
             uint32_t hki  = (G > 0) ? (hvi / G) : hvi;
             uint32_t sOff = ((uint32_t)sid * HV + hvi) * DV * DK;
@@ -318,7 +303,8 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                 float dv = oB.GetValue(dvi);
                 if (dv != 0.0f) {
                     Muls(tr, kB[hki * dkA], dv, DK);
-                    Add(stB[dvi * dkA], stB[dvi * dkA], tr, DK);
+                    Add(tr, stB[dvi * dkA], tr, DK);
+                    DataCopy(stB[dvi * dkA], tr, DK);
                 }
             }
             PipeBarrier<PIPE_V>();
@@ -362,8 +348,8 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
     cQ.FreeTensor(qtB); cK.FreeTensor(kB); cV.FreeTensor(vB); cSt.FreeTensor(stB);
     cSqBuf.FreeTensor(sq); cScBuf.FreeTensor(sr); cRd.FreeTensor(rdT);
     cOutFp32.FreeTensor(oB); cTmp.FreeTensor(tr);
-    cGate.FreeTensor(alT); cGate.FreeTensor(aT); cGate.FreeTensor(sT);
-    cGate.FreeTensor(eG); cGate.FreeTensor(sgT); cBeta.FreeTensor(beB);
+    cGateAl.FreeTensor(alT); cGateA.FreeTensor(aT); cGateS.FreeTensor(sT);
+    cGateE.FreeTensor(eG); cGateSg.FreeTensor(sgT); cBeta.FreeTensor(beB);
 }
 
 } // namespace NsFusedRgd
