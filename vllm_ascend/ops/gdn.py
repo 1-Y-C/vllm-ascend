@@ -416,6 +416,61 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
+        if (
+            attn_metadata.spec_sequence_masks is None
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_decodes > 0
+            and not _EXTRA_CTX.capturing
+        ):
+            # print("4444444444444444444444444444444444444444444444444444")
+            # Fused decode fast path: conv1d + packed recurrent decode
+            # replaces l2norm + gating + recurrence with a single AscendC kernel.
+            non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
+            self_kv_cache = self.kv_cache
+            ssm_state = self_kv_cache[1]
+            num_actual_tokens = attn_metadata.num_actual_tokens
+
+            mixed_qkv = mixed_qkv[:num_actual_tokens]
+            b = b[:num_actual_tokens]
+            a = a[:num_actual_tokens]
+
+            conv_weights = self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            )
+
+            non_spec_qsl_host, non_spec_ci_host = get_causal_conv1d_update_host_args(attn_metadata)
+            conv_weights_T = conv_weights.transpose(0, 1)
+            activation_num = 1 if self.activation else 0
+            output_non_spec = torch.empty_like(mixed_qkv)
+            torch.ops._C_ascend.npu_causal_conv1d_custom(
+                output_non_spec,
+                mixed_qkv,
+                conv_weights_T,
+                conv_state=self_kv_cache[0],
+                bias_opt=self.conv1d.bias,
+                query_start_loc_opt=non_spec_qsl_host,
+                cache_indices_opt=non_spec_ci_host,
+                initial_state_mode_opt=(),
+                num_accepted_tokens_opt=[],
+                activation_mode=activation_num,
+                pad_slot_id=PAD_SLOT_ID,
+                run_mode=1,
+            )
+            mixed_qkv = output_non_spec
+
+            scale_val = float(self.head_k_dim ** -0.5)
+            ssm_state_fp32 = ssm_state.to(torch.float32)
+            result = torch.ops._C_ascend.npu_fused_rgdr_packed_decode(
+                mixed_qkv, a, b,
+                self.A_log, self.dt_bias.to(dtype=torch.float32),
+                ssm_state_fp32,
+                non_spec_state_indices_tensor[:num_actual_tokens],
+                scale_val,
+            )
+            ssm_state.copy_(ssm_state_fp32)
+            core_attn_out[:num_actual_tokens] = result.squeeze(1)
+            return
+
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
@@ -729,3 +784,4 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
+
