@@ -193,10 +193,86 @@ def test_hv16():
     _check(npu_out, npu_state, ref_out, ref_state)
 
 
+def _make_inputs_e2e(HK, HV, DV, DK, B=1, N=8, seed=42):
+    """Build inputs with independent HK/HV (G = HV/HK)."""
+    torch.manual_seed(seed)
+    L = 2 * HK * DK + HV * DV
+    mixed_qkv = torch.randn(B, L, dtype=torch.bfloat16)
+    a = torch.randn(B, HV, dtype=torch.bfloat16)
+    b = torch.randn(B, HV, dtype=torch.bfloat16)
+    a_log = torch.randn(HV, dtype=torch.float32)
+    dt_bias = torch.randn(HV, dtype=torch.float32)
+    state = torch.randn(N, HV, DV, DK, dtype=torch.float32)
+    si = torch.randperm(N)[:B].to(torch.int32)
+    return mixed_qkv, a, b, a_log, dt_bias, state, si
+
+
+def golden_e2e(mixed_qkv, a, b, a_log, dt_bias, state, si, scale_val=1.0):
+    """Vectorized CPU golden for large DV/DK."""
+    compute_dtype = torch.float32
+    B = mixed_qkv.shape[0]; L = mixed_qkv.shape[1]
+    HV = a.shape[1]; DV = state.shape[2]; DK = state.shape[3]
+    HK = (L - HV * DV) // (2 * DK); G = HV // HK; eps = 1e-6
+    a_log_f = a_log.to(compute_dtype); dt_bias_f = dt_bias.to(compute_dtype)
+    out = torch.zeros(B, 1, HV, DV, dtype=torch.bfloat16)
+    state_out = state.clone()
+    for bi in range(B):
+        sid = int(si[bi].item())
+        if sid < 0: continue
+        mx = mixed_qkv[bi].to(compute_dtype)
+        Q = mx[:HK*DK].reshape(HK,DK); K = mx[HK*DK:2*HK*DK].reshape(HK,DK)
+        V = mx[2*HK*DK:2*HK*DK+HV*DV].reshape(HV,DV)
+        Q = Q / torch.sqrt((Q**2).sum(dim=-1,keepdim=True)+eps)
+        K = K / torch.sqrt((K**2).sum(dim=-1,keepdim=True)+eps); Q = Q * scale_val
+        a_f = a[bi].to(compute_dtype); b_f = b[bi].to(compute_dtype)
+        gate = torch.exp(-torch.exp(a_log_f) * torch.log(1.0+torch.exp(a_f+dt_bias_f)))
+        beta = torch.sigmoid(b_f)
+        for hvi in range(HV):
+            hki = hvi // G if G else hvi
+            st = state_out[sid,hvi].to(compute_dtype).clone()
+            if gate[hvi].item()!=1.0: st*=gate[hvi]
+            o = V[hvi] - (st @ K[hki]); o *= beta[hvi]
+            st += K[hki].unsqueeze(0) * o.unsqueeze(-1)
+            o = st @ Q[hki]
+            out[bi,0,hvi] = o.to(torch.bfloat16); state_out[sid,hvi] = st.to(state.dtype)
+    return out, state_out
+
+
+_E2E_COMBOS = [(8,8),(8,16),(8,24),(8,32),(8,64),(16,16),(16,32),(16,64)]
+
+def test_e2e_combos():
+    for HK, HV in _E2E_COMBOS:
+        DV=DK=128
+        mq,a,b,al,db,st,si = _make_inputs_e2e(HK,HV,DV,DK)
+        ref_o,ref_s = golden_e2e(mq,a,b,al,db,st,si)
+        npu_o,npu_s = _run_npu(mq,a,b,al,db,st,si)
+        _check(npu_o,npu_s,ref_o,ref_s)
+        print(f"    HK={HK},HV={HV}: PASS")
+        import gc; gc.collect()
+        torch.npu.empty_cache()
+
+
+def test_batch():
+    """Batch scaling: B=2,4,8 with DV=DK=128, NV=32."""
+    for B in [2, 4, 8]:
+        HK, HV, DV, DK, N = 8, 32, 128, 128, max(8, B)
+        mq,a,b,al,db,st,si = _make_inputs_e2e(HK,HV,DV,DK,B=B,N=N)
+        ref_o,ref_s = golden_e2e(mq,a,b,al,db,st,si)
+        npu_o,npu_s = _run_npu(mq,a,b,al,db,st,si)
+        _check(npu_o,npu_s,ref_o,ref_s)
+        print(f"    B={B},HV={HV}: PASS  out max diff={((npu_o.to(torch.float32)-ref_o.to(torch.float32)).abs().max()):.6f}")
+        import gc; gc.collect()
+        torch.npu.empty_cache()
+
+
 if __name__ == "__main__":
     test_hv8_b1()
     test_hv8_b4()
     test_negative_sid()
     test_scale_override()
     test_hv16()
+    print("--- e2e combos (DV=DK=128) ---")
+    test_e2e_combos()
+    print("--- batch scaling ---")
+    test_batch()
     print("\nALL TESTS PASSED")
