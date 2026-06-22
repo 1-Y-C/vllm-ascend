@@ -265,6 +265,25 @@ def test_batch():
         torch.npu.empty_cache()
 
 
+def test_bf16_state():
+    """Verify bf16 state path (tiling key=2)."""
+    print("test_bf16_state:")
+    B, HV, DV, DK, N = 2, 16, 8, 16, 8
+    torch.manual_seed(42)
+    HK = HV
+    L = 2 * HK * DK + HV * DV
+    mixed_qkv = torch.randn(B, L, dtype=torch.bfloat16)
+    a = torch.randn(B, HV, dtype=torch.bfloat16)
+    b = torch.randn(B, HV, dtype=torch.bfloat16)
+    a_log = torch.randn(HV, dtype=torch.float32)
+    dt_bias = torch.randn(HV, dtype=torch.float32)
+    state = torch.randn(N, HV, DV, DK, dtype=torch.bfloat16)
+    si = torch.randperm(N)[:B].to(torch.int32)
+    ref_out, ref_state = golden(mixed_qkv, a, b, a_log, dt_bias, state, si)
+    npu_out, npu_state = _run_npu(mixed_qkv, a, b, a_log, dt_bias, state, si)
+    _check(npu_out, npu_state, ref_out, ref_state)
+
+
 if __name__ == "__main__":
     test_hv8_b1()
     test_hv8_b4()
@@ -275,4 +294,6 @@ if __name__ == "__main__":
     test_e2e_combos()
     print("--- batch scaling ---")
     test_batch()
+    print("--- bf16 state ---")
+    test_bf16_state()
     print("\nALL TESTS PASSED")

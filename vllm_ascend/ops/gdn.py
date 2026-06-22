@@ -420,9 +420,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
             and attn_metadata.num_decodes > 0
-            and not _EXTRA_CTX.capturing
         ):
-            # print("4444444444444444444444444444444444444444444444444444")
             # Fused decode fast path: conv1d + packed recurrent decode
             # replaces l2norm + gating + recurrence with a single AscendC kernel.
             non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor
@@ -441,33 +439,80 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             non_spec_qsl_host, non_spec_ci_host = get_causal_conv1d_update_host_args(attn_metadata)
             conv_weights_T = conv_weights.transpose(0, 1)
             activation_num = 1 if self.activation else 0
-            output_non_spec = torch.empty_like(mixed_qkv)
-            torch.ops._C_ascend.npu_causal_conv1d_custom(
-                output_non_spec,
-                mixed_qkv,
-                conv_weights_T,
-                conv_state=self_kv_cache[0],
-                bias_opt=self.conv1d.bias,
-                query_start_loc_opt=non_spec_qsl_host,
-                cache_indices_opt=non_spec_ci_host,
-                initial_state_mode_opt=(),
-                num_accepted_tokens_opt=[],
-                activation_mode=activation_num,
-                pad_slot_id=PAD_SLOT_ID,
-                run_mode=1,
-            )
-            mixed_qkv = output_non_spec
+            # graph capture branch
+            if _EXTRA_CTX.capturing:
+                stream = torch_npu.npu.current_stream()
+                event = torch.npu.ExternalEvent()
+                event.wait(stream)
+                event.reset(stream)
+                graph_params = get_graph_params() if not _EXTRA_CTX.is_draft_model else get_draft_graph_params()
+                graph_params.conv1d_events[num_actual_tokens].append(event)
+
+                output_non_spec = torch.empty_like(mixed_qkv)
+                non_spec_q_per_seq = 1
+                graph_params.conv1d_params[num_actual_tokens].append(
+                    (
+                        weak_ref_tensors(output_non_spec),
+                        weak_ref_tensors(mixed_qkv),
+                        weak_ref_tensors(conv_weights_T),
+                        weak_ref_tensors(self_kv_cache[0]),
+                        self.conv1d.bias,
+                        activation_num,
+                        PAD_SLOT_ID,
+                        1,  # run_mode
+                        "non_spec_decode",
+                        self.prefix,
+                        non_spec_qsl_host,
+                        non_spec_ci_host,
+                        [],
+                        non_spec_q_per_seq,
+                    )
+                )
+
+                torch.npu.graph_task_group_begin(stream)
+                torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    output_non_spec,
+                    mixed_qkv,
+                    conv_weights_T,
+                    conv_state=self_kv_cache[0],
+                    bias_opt=self.conv1d.bias,
+                    query_start_loc_opt=non_spec_qsl_host,
+                    cache_indices_opt=non_spec_ci_host,
+                    initial_state_mode_opt=(),
+                    num_accepted_tokens_opt=[],
+                    activation_mode=activation_num,
+                    pad_slot_id=PAD_SLOT_ID,
+                    run_mode=1,
+                )
+                handle = torch.npu.graph_task_group_end(stream)
+                graph_params.conv1d_handles[num_actual_tokens].append(handle)
+                mixed_qkv = output_non_spec
+            else:
+                output_non_spec = torch.empty_like(mixed_qkv)
+                torch.ops._C_ascend.npu_causal_conv1d_custom(
+                    output_non_spec,
+                    mixed_qkv,
+                    conv_weights_T,
+                    conv_state=self_kv_cache[0],
+                    bias_opt=self.conv1d.bias,
+                    query_start_loc_opt=non_spec_qsl_host,
+                    cache_indices_opt=non_spec_ci_host,
+                    initial_state_mode_opt=(),
+                    num_accepted_tokens_opt=[],
+                    activation_mode=activation_num,
+                    pad_slot_id=PAD_SLOT_ID,
+                    run_mode=1,
+                )
+                mixed_qkv = output_non_spec
 
             scale_val = float(self.head_k_dim ** -0.5)
-            ssm_state_fp32 = ssm_state.to(torch.float32)
             result = torch.ops._C_ascend.npu_fused_rgdr_packed_decode(
                 mixed_qkv, a, b,
                 self.A_log, self.dt_bias.to(dtype=torch.float32),
-                ssm_state_fp32,
+                ssm_state,
                 non_spec_state_indices_tensor[:num_actual_tokens],
                 scale_val,
             )
-            ssm_state.copy_(ssm_state_fp32)
             core_attn_out[:num_actual_tokens] = result.squeeze(1)
             return
 

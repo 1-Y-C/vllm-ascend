@@ -26,5 +26,10 @@ fused_rgdr_packed_decode(GM_ADDR mixed_qkv, GM_ADDR a, GM_ADDR b, GM_ADDR a_log,
         op.Init(mixed_qkv, a, b, a_log, dt_bias, state, ssm_state_indices,
                 out, state_out, &tilingData, &pipe);
         op.Process();
+    } else if (TILING_KEY_IS(2)) {
+        KernelFusedRgd<bfloat16_t> op;
+        op.Init(mixed_qkv, a, b, a_log, dt_bias, state, ssm_state_indices,
+                out, state_out, &tilingData, &pipe);
+        op.Process();
     }
 }

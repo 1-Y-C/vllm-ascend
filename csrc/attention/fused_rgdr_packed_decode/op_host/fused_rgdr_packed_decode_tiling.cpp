@@ -88,7 +88,20 @@ ge::graphStatus FusedRgdrPackedDecodeTilingFunc(gert::TilingContext* context)
         currentWorkspace[0] = 0;
     }
 
-    context->SetTilingKey(1);  // TilingKey = 1 for float state
+    auto stateDesc = context->GetInputDesc(5);
+    if (stateDesc == nullptr) {
+        OP_LOGE(context, "GetInputDesc(5) returns null");
+        return ge::GRAPH_FAILED;
+    }
+    ge::DataType stateDType = stateDesc->GetDataType();
+    if (stateDType == ge::DT_FLOAT) {
+        context->SetTilingKey(1);  // TilingKey = 1 for float state
+    } else if (stateDType == ge::DT_BF16) {
+        context->SetTilingKey(2);  // TilingKey = 2 for bf16 state
+    } else {
+        OP_LOGE(context, "Unsupported state dtype, expected float or bf16");
+        return ge::GRAPH_FAILED;
+    }
 
     auto tiling = context->GetTilingData<FusedRgdrPackedDecodeTilingData>();
     if (tiling == nullptr) {

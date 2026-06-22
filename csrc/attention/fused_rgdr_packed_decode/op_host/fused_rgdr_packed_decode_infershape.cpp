@@ -52,7 +52,7 @@ static ge::graphStatus InferShapeFusedRgdrPackedDecode(InferShapeContext *contex
 static ge::graphStatus InferDataTypeFusedRgdrPackedDecode(gert::InferDataTypeContext *context)
 {
     context->SetOutputDataType(0, ge::DT_BF16);
-    context->SetOutputDataType(1, ge::DT_FLOAT);
+    context->SetOutputDataType(1, context->GetInputDataType(5));  // state_out follows state dtype
     return ge::GRAPH_SUCCESS;
 }
 
