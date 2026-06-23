@@ -34,6 +34,7 @@ public:
         const FusedRgdrPackedDecodeTilingData* td, TPipe* pipe);
     __aicore__ inline void Process();
 private:
+    __aicore__ inline void InitLocalBuffers();
     __aicore__ inline void ProcessBatch(uint32_t bi, int32_t sid);
     __aicore__ inline void PrefetchState(uint64_t sOff, uint32_t rows);
     __aicore__ inline void LoadPrefetchedState(uint32_t rows);
@@ -45,6 +46,23 @@ private:
     GlobalTensor<float>      alGm_, dbGm_;
     GlobalTensor<S>          stGm_, stoGm_;
     GlobalTensor<int32_t>    siGm_;
+
+    // Data-movement queues (non-state)
+    TQue<QuePosition::VECIN, BUFFER_NUM>  qSid_, qMq_, qA_, qB_, qAl_, qDb_;
+    TQue<QuePosition::VECOUT, BUFFER_NUM> qOut_;
+    // State double-buffered queues
+    TQue<QuePosition::VECIN, ST_BUF_NUM>  qStRd_;
+    TQue<QuePosition::VECOUT, ST_BUF_NUM> qStWr_;
+
+    // Compute buffers
+    TBuf<TPosition::VECCALC> cQ_, cK_, cV_, cSt_, cStProd_, cRd_, cOutFp32_, cTmp_;
+    TBuf<TPosition::VECCALC> cGateAl_, cGateA_, cGateS_, cGateE_, cGateSg_, cBeta_;
+    TBuf<TPosition::VECCALC> cSqBuf_, cScBuf_;
+
+    // Fixed tensor views
+    LocalTensor<float>   qtB_, kB_, vB_, stB_, stP_, sq_, sr_, rdT_, oB_, tr_;
+    LocalTensor<float>   alT_, aT_, sT_, eG_, beB_;
+    LocalTensor<uint8_t> sgT_;
 };
 
 template<typename S>
@@ -65,6 +83,69 @@ __aicore__ inline void KernelFusedRgd<S>::Init(
     stoGm_.SetGlobalBuffer((__gm__ S*)so, td_.N * HV * DV * DK);
     siGm_.SetGlobalBuffer((__gm__ int32_t*)si, td_.B);
     outGm_.SetGlobalBuffer((__gm__ bfloat16_t*)o, td_.B * 1 * HV * DV);
+
+    InitLocalBuffers();
+}
+
+
+template<typename S>
+__aicore__ inline void KernelFusedRgd<S>::InitLocalBuffers()
+{
+    uint32_t HK = td_.HK, HV = td_.HV, DK = td_.DK, DV = td_.DV;
+    uint32_t dkA = td_.dkAligned, dvA = td_.dvAligned;
+    uint32_t L  = td_.L_qkv;
+    uint32_t vStep = td_.vStep;
+
+    // --- TQue data-movement queues (non-state) ---
+    pipe_->InitBuffer(qSid_,  BUFFER_NUM, 32U);
+    pipe_->InitBuffer(qMq_,   BUFFER_NUM, L * sizeof(bfloat16_t));
+    pipe_->InitBuffer(qA_,    BUFFER_NUM, (HV * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (HV * sizeof(bfloat16_t)));
+    pipe_->InitBuffer(qB_,    BUFFER_NUM, (HV * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (HV * sizeof(bfloat16_t)));
+    pipe_->InitBuffer(qAl_,   BUFFER_NUM, (HV * sizeof(float)      < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(qDb_,   BUFFER_NUM, (HV * sizeof(float)      < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(qOut_,  BUFFER_NUM, (dvA * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (dvA * sizeof(bfloat16_t)));
+
+    // --- State double-buffered queues ---
+    uint32_t stChunkBytes = vStep * dkA * sizeof(S);
+    pipe_->InitBuffer(qStRd_, ST_BUF_NUM, stChunkBytes);
+    pipe_->InitBuffer(qStWr_, ST_BUF_NUM, stChunkBytes);
+
+    // --- Compute buffers (VECCALC) ---
+    pipe_->InitBuffer(cQ_,     HK * dkA * sizeof(float));
+    pipe_->InitBuffer(cK_,     HK * dkA * sizeof(float));
+    pipe_->InitBuffer(cV_,     HV * dvA * sizeof(float));
+    pipe_->InitBuffer(cSt_,    vStep * dkA * sizeof(float));
+    pipe_->InitBuffer(cStProd_, vStep * dkA * sizeof(float));
+    pipe_->InitBuffer(cRd_,    REDUCE_TMP_BYTES);
+    pipe_->InitBuffer(cOutFp32_, dvA * sizeof(float));
+    pipe_->InitBuffer(cSqBuf_, dkA * sizeof(float));
+    pipe_->InitBuffer(cScBuf_, 32U);
+    pipe_->InitBuffer(cTmp_,   dkA * sizeof(float));
+    pipe_->InitBuffer(cGateAl_, (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateA_,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateS_,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateE_,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+    pipe_->InitBuffer(cGateSg_, SIGMOID_TMP_BYTES);
+    pipe_->InitBuffer(cBeta_,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
+
+    // --- Fixed tensor views ---
+    qtB_ = cQ_.Get<float>(HK * dkA);
+    kB_  = cK_.Get<float>(HK * dkA);
+    vB_  = cV_.Get<float>(HV * dvA);
+    stB_ = cSt_.Get<float>(vStep * dkA);
+    stP_ = cStProd_.Get<float>(vStep * dkA);
+    sq_  = cSqBuf_.Get<float>(dkA);
+    sr_  = cScBuf_.Get<float>(8);
+    rdT_ = cRd_.Get<float>(REDUCE_TMP_BYTES / sizeof(float));
+    oB_  = cOutFp32_.Get<float>(dvA);
+    tr_  = cTmp_.Get<float>(dkA);
+
+    alT_ = cGateAl_.Get<float>(HV);
+    aT_  = cGateA_.Get<float>(HV);
+    sT_  = cGateS_.Get<float>(HV);
+    eG_  = cGateE_.Get<float>(HV);
+    sgT_ = cGateSg_.Get<uint8_t>(SIGMOID_TMP_BYTES);
+    beB_ = cBeta_.Get<float>(HV);
 }
 
 
@@ -84,198 +165,139 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
     float ep = td_.eps, scaleVal = td_.scaleVal;
     uint32_t vStep = td_.vStep;
 
-    // --- TQue data-movement queues (non-state) ---
-    TQue<QuePosition::VECIN, BUFFER_NUM>  qSid, qMq, qA, qB, qAl, qDb;
-    TQue<QuePosition::VECOUT, BUFFER_NUM> qOut;
-
-    pipe_->InitBuffer(qSid,  BUFFER_NUM, 32U);
-    pipe_->InitBuffer(qMq,   BUFFER_NUM, L * sizeof(bfloat16_t));
-    pipe_->InitBuffer(qA,    BUFFER_NUM, (HV * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (HV * sizeof(bfloat16_t)));
-    pipe_->InitBuffer(qB,    BUFFER_NUM, (HV * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (HV * sizeof(bfloat16_t)));
-    pipe_->InitBuffer(qAl,   BUFFER_NUM, (HV * sizeof(float)      < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
-    pipe_->InitBuffer(qDb,   BUFFER_NUM, (HV * sizeof(float)      < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
-    pipe_->InitBuffer(qOut,  BUFFER_NUM, (dvA * sizeof(bfloat16_t) < MIN_BUF) ? MIN_BUF : (dvA * sizeof(bfloat16_t)));
-
-    // --- State double-buffered queues ---
-    uint32_t stChunkBytes = vStep * dkA * sizeof(S);
-    TQue<QuePosition::VECIN, ST_BUF_NUM>  qStRd;
-    TQue<QuePosition::VECOUT, ST_BUF_NUM> qStWr;
-    pipe_->InitBuffer(qStRd, ST_BUF_NUM, stChunkBytes);
-    pipe_->InitBuffer(qStWr, ST_BUF_NUM, stChunkBytes);
-
-    // --- Compute buffers (VECCALC) ---
-    TBuf<TPosition::VECCALC> cQ, cK, cV, cSt, cStProd, cRd, cOutFp32, cTmp;
-    TBuf<TPosition::VECCALC> cGateAl, cGateA, cGateS, cGateE, cGateSg, cBeta;
-    TBuf<TPosition::VECCALC> cSqBuf, cScBuf;
-
-    pipe_->InitBuffer(cQ,     HK * dkA * sizeof(float));
-    pipe_->InitBuffer(cK,     HK * dkA * sizeof(float));
-    pipe_->InitBuffer(cV,     HV * dvA * sizeof(float));
-    pipe_->InitBuffer(cSt,    vStep * dkA * sizeof(float));
-    pipe_->InitBuffer(cStProd, vStep * dkA * sizeof(float));  // product buffer for repeat-based MatVecMul
-    pipe_->InitBuffer(cRd,    REDUCE_TMP_BYTES);
-    pipe_->InitBuffer(cOutFp32, dvA * sizeof(float));
-    pipe_->InitBuffer(cSqBuf, dkA * sizeof(float));
-    pipe_->InitBuffer(cScBuf, 32U);
-    pipe_->InitBuffer(cTmp,   dkA * sizeof(float));
-    pipe_->InitBuffer(cGateAl, (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
-    pipe_->InitBuffer(cGateA,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
-    pipe_->InitBuffer(cGateS,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
-    pipe_->InitBuffer(cGateE,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
-    pipe_->InitBuffer(cGateSg, SIGMOID_TMP_BYTES);
-    pipe_->InitBuffer(cBeta,  (HV * sizeof(float) < MIN_BUF) ? MIN_BUF : (HV * sizeof(float)));
-
-    LocalTensor<float> qtB = cQ.Get<float>(HK * dkA);
-    LocalTensor<float> kB  = cK.Get<float>(HK * dkA);
-    LocalTensor<float> vB  = cV.Get<float>(HV * dvA);
-    LocalTensor<float> stB = cSt.Get<float>(vStep * dkA);
-    LocalTensor<float> stP = cStProd.Get<float>(vStep * dkA);  // product buffer
-    LocalTensor<float> sq  = cSqBuf.Get<float>(dkA);
-    LocalTensor<float> sr  = cScBuf.Get<float>(8);
-    LocalTensor<float> rdT = cRd.Get<float>(REDUCE_TMP_BYTES / sizeof(float));
-    LocalTensor<float> oB  = cOutFp32.Get<float>(dvA);
-    LocalTensor<float> tr  = cTmp.Get<float>(dkA);
-
-    LocalTensor<float>    alT = cGateAl.Get<float>(HV);
-    LocalTensor<float>    aT  = cGateA.Get<float>(HV);
-    LocalTensor<float>    sT  = cGateS.Get<float>(HV);
-    LocalTensor<float>    eG  = cGateE.Get<float>(HV);
-    LocalTensor<uint8_t>  sgT = cGateSg.Get<uint8_t>(SIGMOID_TMP_BYTES);
-    LocalTensor<float>    beB = cBeta.Get<float>(HV);
-
     for (uint32_t bi = bs; bi < be; ++bi) {
         // --- Read ssm_state_indices[bi] ---
         int32_t sid;
         {
-            LocalTensor<int32_t> ib = qSid.AllocTensor<int32_t>();
+            LocalTensor<int32_t> ib = qSid_.AllocTensor<int32_t>();
             DataCopyExtParams cp ={1, (uint16_t)sizeof(int32_t), 0, 0, 0};
             DataCopyPad(ib, siGm_[bi], cp, {false, 0, 0, 0});
-            qSid.EnQue(ib);
-            ib = qSid.DeQue<int32_t>();
+            qSid_.EnQue(ib);
+            ib = qSid_.DeQue<int32_t>();
             sid = ib.GetValue(0);
-            qSid.FreeTensor(ib);
+            qSid_.FreeTensor(ib);
         }
 
         // --- Skip branch (output zeros, no state write) ---
         if (sid < 0) {
             for (uint32_t hvi = 0; hvi < HV; ++hvi) {
-                LocalTensor<bfloat16_t> ow = qOut.AllocTensor<bfloat16_t>();
+                LocalTensor<bfloat16_t> ow = qOut_.AllocTensor<bfloat16_t>();
                 Duplicate<bfloat16_t>(ow, 0, dvA);
-                qOut.EnQue(ow);
-                ow = qOut.DeQue<bfloat16_t>();
+                qOut_.EnQue(ow);
+                ow = qOut_.DeQue<bfloat16_t>();
                 DataCopyExtParams cp ={1, (uint16_t)(dvA * sizeof(bfloat16_t)), 0, 0, 0};
                 DataCopyPad(outGm_[bi * HV * DV + hvi * DV], ow, cp);
-                qOut.FreeTensor(ow);
+                qOut_.FreeTensor(ow);
             }
             continue;
         }
 
         // --- Step 1 UNPACK ---
         {
-            LocalTensor<bfloat16_t> mx = qMq.AllocTensor<bfloat16_t>();
+            LocalTensor<bfloat16_t> mx = qMq_.AllocTensor<bfloat16_t>();
             DataCopyExtParams cp ={1, (uint16_t)(L * sizeof(bfloat16_t)), 0, 0, 0};
             DataCopyPad(mx, mqGm_[bi * L], cp, {false, 0, 0, 0});
-            qMq.EnQue(mx);
-            mx = qMq.DeQue<bfloat16_t>();
+            qMq_.EnQue(mx);
+            mx = qMq_.DeQue<bfloat16_t>();
             uint32_t qO = 0, kO = HK * DK, vO = 2 * HK * DK;
-            Cast<float, bfloat16_t>(qtB, mx[qO], RoundMode::CAST_NONE, HK * DK);
-            Cast<float, bfloat16_t>(kB, mx[kO], RoundMode::CAST_NONE, HK * DK);
-            Cast<float, bfloat16_t>(vB, mx[vO], RoundMode::CAST_NONE, HV * DV);
-            qMq.FreeTensor(mx);
+            Cast<float, bfloat16_t>(qtB_, mx[qO], RoundMode::CAST_NONE, HK * DK);
+            Cast<float, bfloat16_t>(kB_, mx[kO], RoundMode::CAST_NONE, HK * DK);
+            Cast<float, bfloat16_t>(vB_, mx[vO], RoundMode::CAST_NONE, HV * DV);
+            qMq_.FreeTensor(mx);
         }
 
         // --- Step 2 L2NORM Q ---
         PipeBarrier<PIPE_V>();
         for (uint32_t h = 0; h < HK; ++h) {
-            Mul(sq, qtB[h * dkA], qtB[h * dkA], DK);
-            ReduceSum<float>(sr, sq, rdT, (int32_t)DK);
+            Mul(sq_, qtB_[h * dkA], qtB_[h * dkA], DK);
+            ReduceSum<float>(sr_, sq_, rdT_, (int32_t)DK);
             PipeBarrier<PIPE_V>();
-            Adds(sr, sr, ep, 1);
-            Rsqrt(sr, sr, 1);
+            Adds(sr_, sr_, ep, 1);
+            Rsqrt(sr_, sr_, 1);
             PipeBarrier<PIPE_V>();
-            Muls(qtB[h * dkA], qtB[h * dkA], sr.GetValue(0), DK);
+            Muls(qtB_[h * dkA], qtB_[h * dkA], sr_.GetValue(0), DK);
         }
         // --- Step 2 L2NORM K ---
         for (uint32_t h = 0; h < HK; ++h) {
-            Mul(sq, kB[h * dkA], kB[h * dkA], DK);
-            ReduceSum<float>(sr, sq, rdT, (int32_t)DK);
+            Mul(sq_, kB_[h * dkA], kB_[h * dkA], DK);
+            ReduceSum<float>(sr_, sq_, rdT_, (int32_t)DK);
             PipeBarrier<PIPE_V>();
-            Adds(sr, sr, ep, 1);
-            Rsqrt(sr, sr, 1);
+            Adds(sr_, sr_, ep, 1);
+            Rsqrt(sr_, sr_, 1);
             PipeBarrier<PIPE_V>();
-            Muls(kB[h * dkA], kB[h * dkA], sr.GetValue(0), DK);
+            Muls(kB_[h * dkA], kB_[h * dkA], sr_.GetValue(0), DK);
         }
 
         // --- Step 3 SCALE ---
         for (uint32_t h = 0; h < HK; ++h) {
-            Muls(qtB[h * dkA], qtB[h * dkA], scaleVal, DK);
+            Muls(qtB_[h * dkA], qtB_[h * dkA], scaleVal, DK);
         }
 
         // --- Step 4 GATE ---
         {
-            LocalTensor<float> alL = qAl.AllocTensor<float>();
+            LocalTensor<float> alL = qAl_.AllocTensor<float>();
             DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
             DataCopyPad(alL, alGm_, cp, {false, 0, 0, 0});
-            qAl.EnQue(alL);
-            alL = qAl.DeQue<float>();
-            Exp(eG, alL, HV);
-            Muls(eG, eG, -1.0f, HV);
-            qAl.FreeTensor(alL);
+            qAl_.EnQue(alL);
+            alL = qAl_.DeQue<float>();
+            Exp(eG_, alL, HV);
+            Muls(eG_, eG_, -1.0f, HV);
+            qAl_.FreeTensor(alL);
         }
         PipeBarrier<PIPE_V>();
         {
-            LocalTensor<bfloat16_t> aL = qA.AllocTensor<bfloat16_t>();
+            LocalTensor<bfloat16_t> aL = qA_.AllocTensor<bfloat16_t>();
             DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
             DataCopyPad(aL, aGm_[bi * HV], cp, {false, 0, 0, 0});
-            qA.EnQue(aL);
-            aL = qA.DeQue<bfloat16_t>();
-            Cast<float, bfloat16_t>(aT, aL, RoundMode::CAST_NONE, HV);
-            qA.FreeTensor(aL);
+            qA_.EnQue(aL);
+            aL = qA_.DeQue<bfloat16_t>();
+            Cast<float, bfloat16_t>(aT_, aL, RoundMode::CAST_NONE, HV);
+            qA_.FreeTensor(aL);
         }
         {
-            LocalTensor<float> dL = qDb.AllocTensor<float>();
+            LocalTensor<float> dL = qDb_.AllocTensor<float>();
             DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
             DataCopyPad(dL, dbGm_, cp, {false, 0, 0, 0});
-            qDb.EnQue(dL);
-            dL = qDb.DeQue<float>();
-            Add(sT, aT, dL, HV);
-            qDb.FreeTensor(dL);
+            qDb_.EnQue(dL);
+            dL = qDb_.DeQue<float>();
+            Add(sT_, aT_, dL, HV);
+            qDb_.FreeTensor(dL);
         }
         PipeBarrier<PIPE_V>();
-        Exp(sT, sT, HV);
-        Adds(sT, sT, 1.0f, HV);
-        Ln(sT, sT, HV);
-        Mul(eG, eG, sT, HV);
-        Exp(eG, eG, HV);
+        Exp(sT_, sT_, HV);
+        Adds(sT_, sT_, 1.0f, HV);
+        Ln(sT_, sT_, HV);
+        Mul(eG_, eG_, sT_, HV);
+        Exp(eG_, eG_, HV);
 
         // --- Step 5 BETA ---
         {
-            LocalTensor<bfloat16_t> bL = qB.AllocTensor<bfloat16_t>();
+            LocalTensor<bfloat16_t> bL = qB_.AllocTensor<bfloat16_t>();
             DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
             DataCopyPad(bL, bGm_[bi * HV], cp, {false, 0, 0, 0});
-            qB.EnQue(bL);
-            bL = qB.DeQue<bfloat16_t>();
-            Cast<float, bfloat16_t>(sT, bL, RoundMode::CAST_NONE, HV);
-            qB.FreeTensor(bL);
+            qB_.EnQue(bL);
+            bL = qB_.DeQue<bfloat16_t>();
+            Cast<float, bfloat16_t>(sT_, bL, RoundMode::CAST_NONE, HV);
+            qB_.FreeTensor(bL);
         }
         PipeBarrier<PIPE_V>();
-        Sigmoid<float>(beB, sT, sgT, HV);
+        Sigmoid<float>(beB_, sT_, sgT_, HV);
         PipeBarrier<PIPE_MTE3>();
 
         // --- Step 6+7 RECURRENCE + OUTPUT (vStep-tiled, double-buffered) ---
         for (uint32_t hvi = 0; hvi < HV; ++hvi) {
             uint32_t hki  = (G > 0) ? (hvi / G) : hvi;
             uint32_t sOff = ((uint32_t)sid * HV + hvi) * DV * DK;
-            float    ev   = eG.GetValue(hvi);
-            float    bv   = beB.GetValue(hvi);
+            float    ev   = eG_.GetValue(hvi);
+            float    bv   = beB_.GetValue(hvi);
 
             // Prefetch first state chunk
             uint32_t firstV = (vStep <= DV) ? vStep : DV;
             {
-                LocalTensor<S> ch = qStRd.AllocTensor<S>();
+                LocalTensor<S> ch = qStRd_.AllocTensor<S>();
                 DataCopyExtParams cp ={1, (uint16_t)(firstV * DK * sizeof(S)), 0, 0, 0};
                 DataCopyPad(ch, stGm_[sOff], cp, {false, 0, 0, 0});
-                qStRd.EnQue(ch);
+                qStRd_.EnQue(ch);
             }
 
             for (uint32_t dvi = 0; dvi < DV; dvi += vStep) {
@@ -284,22 +306,22 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
 
                 // Load prefetched state into compute buffer
                 {
-                    LocalTensor<S> ch = qStRd.DeQue<S>();
+                    LocalTensor<S> ch = qStRd_.DeQue<S>();
                     if constexpr (std::is_same<S, float>::value) {
-                        DataCopy(stB, ch, curV * DK);
+                        DataCopy(stB_, ch, curV * DK);
                     } else {
-                        Cast<float, bfloat16_t>(stB, ch, RoundMode::CAST_NONE, curV * DK);
+                        Cast<float, bfloat16_t>(stB_, ch, RoundMode::CAST_NONE, curV * DK);
                     }
-                    qStRd.FreeTensor(ch);
+                    qStRd_.FreeTensor(ch);
                 }
 
                 // Prefetch next chunk (if any)
                 if (dvi + vStep < DV) {
                     uint32_t nextV = (dvi + 2 * vStep <= DV) ? vStep : (DV - dvi - vStep);
-                    LocalTensor<S> ch = qStRd.AllocTensor<S>();
+                    LocalTensor<S> ch = qStRd_.AllocTensor<S>();
                     DataCopyExtParams cp ={1, (uint16_t)(nextV * DK * sizeof(S)), 0, 0, 0};
                     DataCopyPad(ch, stGm_[sOff + (dvi + vStep) * DK], cp, {false, 0, 0, 0});
-                    qStRd.EnQue(ch);
+                    qStRd_.EnQue(ch);
                 }
 
                 PipeBarrier<PIPE_V>();
@@ -310,7 +332,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                     uint32_t tot = curV * DK;
                     for (uint32_t o = 0; o < tot; o += MULS_CHUNK) {
                         uint32_t c = (o + MULS_CHUNK <= tot) ? MULS_CHUNK : (tot - o);
-                        Muls(stB[o], stB[o], ev, c);
+                        Muls(stB_[o], stB_[o], ev, c);
                     }
                     PipeBarrier<PIPE_V>();
                 }
@@ -320,7 +342,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                     uint32_t rs = dkA / DIMS_PER_BLOCK;
                     for (uint32_t k = 0; k < DK; k += FOLD_HALF) {
                         uint64_t mask = (k + FOLD_HALF <= DK) ? FOLD_HALF : (DK - k);
-                        Mul(stP[k], stB[k], kB[hki * dkA + k], mask, (uint64_t)curV,
+                        Mul(stP_[k], stB_[k], kB_[hki * dkA + k], mask, (uint64_t)curV,
                             {1, 1, 1, static_cast<uint8_t>(rs), static_cast<uint8_t>(rs), 0});
                     }
                 }
@@ -331,31 +353,31 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                         uint32_t active = DK;
                         while (active > FOLD_HALF) {
                             uint32_t half = active >> 1;
-                            Add(stP[ro], stP[ro], stP[ro + half], half);
+                            Add(stP_[ro], stP_[ro], stP_[ro + half], half);
                             PipeBarrier<PIPE_V>();
                             active = half;
                         }
-                        WholeReduceSum(oB[d], stP[ro], active, 1, 1, 1, DIMS_PER_BLOCK);
+                        WholeReduceSum(oB_[d], stP_[ro], active, 1, 1, 1, DIMS_PER_BLOCK);
                     }
                 } else {
                     for (uint32_t d = 0; d < curV; ++d) {
-                        ReduceSum<float>(sr, stP[d * dkA], rdT, (int32_t)DK);
+                        ReduceSum<float>(sr_, stP_[d * dkA], rdT_, (int32_t)DK);
                         PipeBarrier<PIPE_V>();
-                        oB.SetValue(d, sr.GetValue(0));
+                        oB_.SetValue(d, sr_.GetValue(0));
                     }
                 }
                 PipeBarrier<PIPE_V>();
-                Sub(oB, vB[hvi * dvA + dvi], oB, curV);
-                Muls(oB, oB, bv, curV);
+                Sub(oB_, vB_[hvi * dvA + dvi], oB_, curV);
+                Muls(oB_, oB_, bv, curV);
                 PipeBarrier<PIPE_V>();
 
                 // --- State update: S[d] += K * delta[d] ---
                 for (uint32_t d = 0; d < curV; ++d) {
-                    float dv_val = oB.GetValue(d);
+                    float dv_val = oB_.GetValue(d);
                     if (dv_val != 0.0f) {
-                        Muls(tr, kB[hki * dkA], dv_val, DK);
-                        Add(tr, stB[d * dkA], tr, DK);
-                        DataCopy(stB[d * dkA], tr, DK);
+                        Muls(tr_, kB_[hki * dkA], dv_val, DK);
+                        Add(tr_, stB_[d * dkA], tr_, DK);
+                        DataCopy(stB_[d * dkA], tr_, DK);
                     }
                 }
                 PipeBarrier<PIPE_V>();
@@ -365,7 +387,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                     uint32_t rs = dkA / DIMS_PER_BLOCK;
                     for (uint32_t k = 0; k < DK; k += FOLD_HALF) {
                         uint64_t mask = (k + FOLD_HALF <= DK) ? FOLD_HALF : (DK - k);
-                        Mul(stP[k], stB[k], qtB[hki * dkA + k], mask, (uint64_t)curV,
+                        Mul(stP_[k], stB_[k], qtB_[hki * dkA + k], mask, (uint64_t)curV,
                             {1, 1, 1, static_cast<uint8_t>(rs), static_cast<uint8_t>(rs), 0});
                     }
                 }
@@ -376,56 +398,56 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                         uint32_t active = DK;
                         while (active > FOLD_HALF) {
                             uint32_t half = active >> 1;
-                            Add(stP[ro], stP[ro], stP[ro + half], half);
+                            Add(stP_[ro], stP_[ro], stP_[ro + half], half);
                             PipeBarrier<PIPE_V>();
                             active = half;
                         }
-                        WholeReduceSum(oB[d], stP[ro], active, 1, 1, 1, DIMS_PER_BLOCK);
+                        WholeReduceSum(oB_[d], stP_[ro], active, 1, 1, 1, DIMS_PER_BLOCK);
                     }
                 } else {
                     for (uint32_t d = 0; d < curV; ++d) {
-                        ReduceSum<float>(sr, stP[d * dkA], rdT, (int32_t)DK);
+                        ReduceSum<float>(sr_, stP_[d * dkA], rdT_, (int32_t)DK);
                         PipeBarrier<PIPE_V>();
-                        oB.SetValue(d, sr.GetValue(0));
+                        oB_.SetValue(d, sr_.GetValue(0));
                     }
                 }
                 PipeBarrier<PIPE_V>();
 
                 // Write output
                 {
-                    LocalTensor<bfloat16_t> ow = qOut.AllocTensor<bfloat16_t>();
-                    Cast<bfloat16_t, float>(ow, oB, RoundMode::CAST_RINT, curV);
-                    qOut.EnQue(ow);
-                    ow = qOut.DeQue<bfloat16_t>();
+                    LocalTensor<bfloat16_t> ow = qOut_.AllocTensor<bfloat16_t>();
+                    Cast<bfloat16_t, float>(ow, oB_, RoundMode::CAST_RINT, curV);
+                    qOut_.EnQue(ow);
+                    ow = qOut_.DeQue<bfloat16_t>();
                     DataCopyExtParams cp ={1, (uint16_t)(curV * sizeof(bfloat16_t)), 0, 0, 0};
                     DataCopyPad(outGm_[bi * HV * DV + hvi * DV + dvi], ow, cp);
-                    qOut.FreeTensor(ow);
+                    qOut_.FreeTensor(ow);
                 }
 
                 // Write state back (double-buffered)
                 {
-                    LocalTensor<S> ch = qStWr.AllocTensor<S>();
+                    LocalTensor<S> ch = qStWr_.AllocTensor<S>();
                     if constexpr (std::is_same<S, float>::value) {
-                        DataCopy(ch, stB, curV * DK);
+                        DataCopy(ch, stB_, curV * DK);
                     } else {
-                        Cast(ch, stB, RoundMode::CAST_RINT, curV * DK);
+                        Cast(ch, stB_, RoundMode::CAST_RINT, curV * DK);
                     }
-                    qStWr.EnQue(ch);
-                    ch = qStWr.DeQue<S>();
+                    qStWr_.EnQue(ch);
+                    ch = qStWr_.DeQue<S>();
                     DataCopyExtParams cp ={1, (uint16_t)(curV * DK * sizeof(S)), 0, 0, 0};
                     DataCopyPad(stoGm_[sOff + chunkOff], ch, cp);
-                    qStWr.FreeTensor(ch);
+                    qStWr_.FreeTensor(ch);
                 }
                 PipeBarrier<PIPE_MTE3>();
             }
         }
     }
 
-    cQ.FreeTensor(qtB); cK.FreeTensor(kB); cV.FreeTensor(vB); cSt.FreeTensor(stB); cStProd.FreeTensor(stP);
-    cSqBuf.FreeTensor(sq); cScBuf.FreeTensor(sr); cRd.FreeTensor(rdT);
-    cOutFp32.FreeTensor(oB); cTmp.FreeTensor(tr);
-    cGateAl.FreeTensor(alT); cGateA.FreeTensor(aT); cGateS.FreeTensor(sT);
-    cGateE.FreeTensor(eG); cGateSg.FreeTensor(sgT); cBeta.FreeTensor(beB);
+    cQ_.FreeTensor(qtB_); cK_.FreeTensor(kB_); cV_.FreeTensor(vB_); cSt_.FreeTensor(stB_); cStProd_.FreeTensor(stP_);
+    cSqBuf_.FreeTensor(sq_); cScBuf_.FreeTensor(sr_); cRd_.FreeTensor(rdT_);
+    cOutFp32_.FreeTensor(oB_); cTmp_.FreeTensor(tr_);
+    cGateAl_.FreeTensor(alT_); cGateA_.FreeTensor(aT_); cGateS_.FreeTensor(sT_);
+    cGateE_.FreeTensor(eG_); cGateSg_.FreeTensor(sgT_); cBeta_.FreeTensor(beB_);
 }
 
 } // namespace NsFusedRgd
