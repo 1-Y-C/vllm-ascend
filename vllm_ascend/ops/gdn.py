@@ -416,6 +416,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
+        # if False and (
         if (
             attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0

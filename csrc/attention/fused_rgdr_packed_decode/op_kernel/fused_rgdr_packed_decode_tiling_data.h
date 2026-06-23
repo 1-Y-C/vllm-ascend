@@ -23,6 +23,7 @@ struct FusedRgdrPackedDecodeTilingData {
     uint32_t dvAligned = 0;
     float scaleVal = 0.0f;
     float eps = 1e-6f;
+    uint32_t vStep = 16;
 };
 
 #endif

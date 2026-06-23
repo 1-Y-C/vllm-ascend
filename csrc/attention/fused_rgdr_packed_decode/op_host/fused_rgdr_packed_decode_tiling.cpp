@@ -131,6 +131,12 @@ ge::graphStatus FusedRgdrPackedDecodeTilingFunc(gert::TilingContext* context)
     tiling->scaleVal = scaleVal;
     tiling->eps = 1e-6f;
 
+    // vStep: tile DV dimension to stay within UB budget.
+    // vStep=32 works for float state (UB ~192KB on A3).
+    uint32_t vStep = (HV <= 16) ? 32U : 16U;
+    if (DV < vStep) vStep = DV;
+    tiling->vStep = vStep;
+
     context->SetBlockDim(ascendcPlatform.CalcTschNumBlocks(aivNum, aicNum, aivNum));
     auto blockDim = context->GetBlockDim();
     if (blockDim == 0) {
