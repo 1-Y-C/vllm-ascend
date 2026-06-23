@@ -321,7 +321,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                     for (uint32_t k = 0; k < DK; k += FOLD_HALF) {
                         uint64_t mask = (k + FOLD_HALF <= DK) ? FOLD_HALF : (DK - k);
                         Mul(stP[k], stB[k], kB[hki * dkA + k], mask, (uint64_t)curV,
-                            {1, 1, 1, rs, rs, 0});
+                            {1, 1, 1, static_cast<uint8_t>(rs), static_cast<uint8_t>(rs), 0});
                     }
                 }
                 PipeBarrier<PIPE_V>();
@@ -366,7 +366,7 @@ __aicore__ inline void KernelFusedRgd<S>::Process() {
                     for (uint32_t k = 0; k < DK; k += FOLD_HALF) {
                         uint64_t mask = (k + FOLD_HALF <= DK) ? FOLD_HALF : (DK - k);
                         Mul(stP[k], stB[k], qtB[hki * dkA + k], mask, (uint64_t)curV,
-                            {1, 1, 1, rs, rs, 0});
+                            {1, 1, 1, static_cast<uint8_t>(rs), static_cast<uint8_t>(rs), 0});
                     }
                 }
                 PipeBarrier<PIPE_V>();
