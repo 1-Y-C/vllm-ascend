@@ -35,10 +35,6 @@ public:
     __aicore__ inline void Process();
 private:
     __aicore__ inline void InitLocalBuffers();
-    __aicore__ inline void ProcessBatch(uint32_t bi, int32_t sid);
-    __aicore__ inline void PrefetchState(uint64_t sOff, uint32_t rows);
-    __aicore__ inline void LoadPrefetchedState(uint32_t rows);
-    __aicore__ inline void WriteBackState(uint64_t sOff, uint32_t rows);
 
     TPipe* pipe_;
     FusedRgdrPackedDecodeTilingData td_;
