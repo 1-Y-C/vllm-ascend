@@ -153,139 +153,157 @@ template<typename S>
 __aicore__ inline void KernelFusedRgd<S>::Process() {
     if (td_.B == 0) return;
 
-    uint32_t ci = GetBlockIdx();
-    uint32_t bs = ci * td_.batchPerCore;
-    uint32_t be = bs + td_.batchPerCore;
-    if (be > td_.B) be = td_.B;
-    if (bs >= be) return;
-
     uint32_t HK = td_.HK, HV = td_.HV, DK = td_.DK, DV = td_.DV;
     uint32_t dkA = td_.dkAligned, dvA = td_.dvAligned;
     uint32_t L  = td_.L_qkv, G = td_.G;
     float ep = td_.eps, scaleVal = td_.scaleVal;
     uint32_t vStep = td_.vStep;
 
-    for (uint32_t bi = bs; bi < be; ++bi) {
-        // --- Read ssm_state_indices[bi] ---
-        int32_t sid;
-        {
-            LocalTensor<int32_t> ib = qSid_.AllocTensor<int32_t>();
-            DataCopyExtParams cp ={1, (uint16_t)sizeof(int32_t), 0, 0, 0};
-            DataCopyPad(ib, siGm_[bi], cp, {false, 0, 0, 0});
-            qSid_.EnQue(ib);
-            ib = qSid_.DeQue<int32_t>();
-            sid = ib.GetValue(0);
-            qSid_.FreeTensor(ib);
+    uint32_t totalUnits = td_.totalUnits;
+    uint32_t blockNum = GetBlockNum();
+    if (totalUnits == 0 || blockNum == 0) return;
+    uint32_t unitsPerCore = (totalUnits + blockNum - 1) / blockNum;
+    uint32_t startUnit = GetBlockIdx() * unitsPerCore;
+    uint32_t endUnit = (startUnit + unitsPerCore > totalUnits) ? totalUnits : (startUnit + unitsPerCore);
+    if (startUnit >= endUnit) return;
+
+    int32_t lastBi = -1;
+    int32_t sid = 0;
+    bool skipBatch = false;
+
+    for (uint32_t ui = startUnit; ui < endUnit; ++ui) {
+        uint32_t bi = ui / HV;
+        uint32_t hvi = ui % HV;
+
+        // --- Per-batch setup (once per batch on this core) ---
+        if (static_cast<int32_t>(bi) != lastBi) {
+            lastBi = static_cast<int32_t>(bi);
+            skipBatch = false;
+
+            // Read ssm_state_indices[bi]
+            {
+                LocalTensor<int32_t> ib = qSid_.AllocTensor<int32_t>();
+                DataCopyExtParams cp ={1, (uint16_t)sizeof(int32_t), 0, 0, 0};
+                DataCopyPad(ib, siGm_[bi], cp, {false, 0, 0, 0});
+                qSid_.EnQue(ib);
+                ib = qSid_.DeQue<int32_t>();
+                sid = static_cast<int32_t>(ib.GetValue(0));
+                qSid_.FreeTensor(ib);
+            }
+
+            if (sid < 0) {
+                skipBatch = true;
+            }
+
+            if (!skipBatch) {
+                // --- Step 1 UNPACK ---
+                {
+                    LocalTensor<bfloat16_t> mx = qMq_.AllocTensor<bfloat16_t>();
+                    DataCopyExtParams cp ={1, (uint16_t)(L * sizeof(bfloat16_t)), 0, 0, 0};
+                    DataCopyPad(mx, mqGm_[bi * L], cp, {false, 0, 0, 0});
+                    qMq_.EnQue(mx);
+                    mx = qMq_.DeQue<bfloat16_t>();
+                    uint32_t qO = 0, kO = HK * DK, vO = 2 * HK * DK;
+                    Cast<float, bfloat16_t>(qtB_, mx[qO], RoundMode::CAST_NONE, HK * DK);
+                    Cast<float, bfloat16_t>(kB_, mx[kO], RoundMode::CAST_NONE, HK * DK);
+                    Cast<float, bfloat16_t>(vB_, mx[vO], RoundMode::CAST_NONE, HV * DV);
+                    qMq_.FreeTensor(mx);
+                }
+
+                // --- Step 2 L2NORM Q ---
+                PipeBarrier<PIPE_V>();
+                for (uint32_t h = 0; h < HK; ++h) {
+                    Mul(sq_, qtB_[h * dkA], qtB_[h * dkA], DK);
+                    ReduceSum<float>(sr_, sq_, rdT_, (int32_t)DK);
+                    PipeBarrier<PIPE_V>();
+                    Adds(sr_, sr_, ep, 1);
+                    Rsqrt(sr_, sr_, 1);
+                    PipeBarrier<PIPE_V>();
+                    Muls(qtB_[h * dkA], qtB_[h * dkA], sr_.GetValue(0), DK);
+                }
+                // --- Step 2 L2NORM K ---
+                for (uint32_t h = 0; h < HK; ++h) {
+                    Mul(sq_, kB_[h * dkA], kB_[h * dkA], DK);
+                    ReduceSum<float>(sr_, sq_, rdT_, (int32_t)DK);
+                    PipeBarrier<PIPE_V>();
+                    Adds(sr_, sr_, ep, 1);
+                    Rsqrt(sr_, sr_, 1);
+                    PipeBarrier<PIPE_V>();
+                    Muls(kB_[h * dkA], kB_[h * dkA], sr_.GetValue(0), DK);
+                }
+
+                // --- Step 3 SCALE ---
+                for (uint32_t h = 0; h < HK; ++h) {
+                    Muls(qtB_[h * dkA], qtB_[h * dkA], scaleVal, DK);
+                }
+
+                // --- Step 4 GATE ---
+                {
+                    LocalTensor<float> alL = qAl_.AllocTensor<float>();
+                    DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
+                    DataCopyPad(alL, alGm_, cp, {false, 0, 0, 0});
+                    qAl_.EnQue(alL);
+                    alL = qAl_.DeQue<float>();
+                    Exp(eG_, alL, HV);
+                    Muls(eG_, eG_, -1.0f, HV);
+                    qAl_.FreeTensor(alL);
+                }
+                PipeBarrier<PIPE_V>();
+                {
+                    LocalTensor<bfloat16_t> aL = qA_.AllocTensor<bfloat16_t>();
+                    DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
+                    DataCopyPad(aL, aGm_[bi * HV], cp, {false, 0, 0, 0});
+                    qA_.EnQue(aL);
+                    aL = qA_.DeQue<bfloat16_t>();
+                    Cast<float, bfloat16_t>(aT_, aL, RoundMode::CAST_NONE, HV);
+                    qA_.FreeTensor(aL);
+                }
+                {
+                    LocalTensor<float> dL = qDb_.AllocTensor<float>();
+                    DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
+                    DataCopyPad(dL, dbGm_, cp, {false, 0, 0, 0});
+                    qDb_.EnQue(dL);
+                    dL = qDb_.DeQue<float>();
+                    Add(sT_, aT_, dL, HV);
+                    qDb_.FreeTensor(dL);
+                }
+                PipeBarrier<PIPE_V>();
+                Exp(sT_, sT_, HV);
+                Adds(sT_, sT_, 1.0f, HV);
+                Ln(sT_, sT_, HV);
+                Mul(eG_, eG_, sT_, HV);
+                Exp(eG_, eG_, HV);
+
+                // --- Step 5 BETA ---
+                {
+                    LocalTensor<bfloat16_t> bL = qB_.AllocTensor<bfloat16_t>();
+                    DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
+                    DataCopyPad(bL, bGm_[bi * HV], cp, {false, 0, 0, 0});
+                    qB_.EnQue(bL);
+                    bL = qB_.DeQue<bfloat16_t>();
+                    Cast<float, bfloat16_t>(sT_, bL, RoundMode::CAST_NONE, HV);
+                    qB_.FreeTensor(bL);
+                }
+                PipeBarrier<PIPE_V>();
+                Sigmoid<float>(beB_, sT_, sgT_, HV);
+                PipeBarrier<PIPE_MTE3>();
+            }
         }
 
-        // --- Skip branch (output zeros, no state write) ---
-        if (sid < 0) {
-            for (uint32_t hvi = 0; hvi < HV; ++hvi) {
-                LocalTensor<bfloat16_t> ow = qOut_.AllocTensor<bfloat16_t>();
-                Duplicate<bfloat16_t>(ow, 0, dvA);
-                qOut_.EnQue(ow);
-                ow = qOut_.DeQue<bfloat16_t>();
-                DataCopyExtParams cp ={1, (uint16_t)(dvA * sizeof(bfloat16_t)), 0, 0, 0};
-                DataCopyPad(outGm_[bi * HV * DV + hvi * DV], ow, cp);
-                qOut_.FreeTensor(ow);
-            }
+        // --- Skip branch (output zeros for this head) ---
+        if (skipBatch) {
+            LocalTensor<bfloat16_t> ow = qOut_.AllocTensor<bfloat16_t>();
+            Duplicate<bfloat16_t>(ow, 0, dvA);
+            qOut_.EnQue(ow);
+            ow = qOut_.DeQue<bfloat16_t>();
+            DataCopyExtParams cp ={1, (uint16_t)(dvA * sizeof(bfloat16_t)), 0, 0, 0};
+            DataCopyPad(outGm_[bi * HV * DV + hvi * DV], ow, cp);
+            qOut_.FreeTensor(ow);
             continue;
         }
 
-        // --- Step 1 UNPACK ---
+        // --- Step 6+7 RECURRENCE + OUTPUT for head (bi, hvi) ---
         {
-            LocalTensor<bfloat16_t> mx = qMq_.AllocTensor<bfloat16_t>();
-            DataCopyExtParams cp ={1, (uint16_t)(L * sizeof(bfloat16_t)), 0, 0, 0};
-            DataCopyPad(mx, mqGm_[bi * L], cp, {false, 0, 0, 0});
-            qMq_.EnQue(mx);
-            mx = qMq_.DeQue<bfloat16_t>();
-            uint32_t qO = 0, kO = HK * DK, vO = 2 * HK * DK;
-            Cast<float, bfloat16_t>(qtB_, mx[qO], RoundMode::CAST_NONE, HK * DK);
-            Cast<float, bfloat16_t>(kB_, mx[kO], RoundMode::CAST_NONE, HK * DK);
-            Cast<float, bfloat16_t>(vB_, mx[vO], RoundMode::CAST_NONE, HV * DV);
-            qMq_.FreeTensor(mx);
-        }
-
-        // --- Step 2 L2NORM Q ---
-        PipeBarrier<PIPE_V>();
-        for (uint32_t h = 0; h < HK; ++h) {
-            Mul(sq_, qtB_[h * dkA], qtB_[h * dkA], DK);
-            ReduceSum<float>(sr_, sq_, rdT_, (int32_t)DK);
-            PipeBarrier<PIPE_V>();
-            Adds(sr_, sr_, ep, 1);
-            Rsqrt(sr_, sr_, 1);
-            PipeBarrier<PIPE_V>();
-            Muls(qtB_[h * dkA], qtB_[h * dkA], sr_.GetValue(0), DK);
-        }
-        // --- Step 2 L2NORM K ---
-        for (uint32_t h = 0; h < HK; ++h) {
-            Mul(sq_, kB_[h * dkA], kB_[h * dkA], DK);
-            ReduceSum<float>(sr_, sq_, rdT_, (int32_t)DK);
-            PipeBarrier<PIPE_V>();
-            Adds(sr_, sr_, ep, 1);
-            Rsqrt(sr_, sr_, 1);
-            PipeBarrier<PIPE_V>();
-            Muls(kB_[h * dkA], kB_[h * dkA], sr_.GetValue(0), DK);
-        }
-
-        // --- Step 3 SCALE ---
-        for (uint32_t h = 0; h < HK; ++h) {
-            Muls(qtB_[h * dkA], qtB_[h * dkA], scaleVal, DK);
-        }
-
-        // --- Step 4 GATE ---
-        {
-            LocalTensor<float> alL = qAl_.AllocTensor<float>();
-            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
-            DataCopyPad(alL, alGm_, cp, {false, 0, 0, 0});
-            qAl_.EnQue(alL);
-            alL = qAl_.DeQue<float>();
-            Exp(eG_, alL, HV);
-            Muls(eG_, eG_, -1.0f, HV);
-            qAl_.FreeTensor(alL);
-        }
-        PipeBarrier<PIPE_V>();
-        {
-            LocalTensor<bfloat16_t> aL = qA_.AllocTensor<bfloat16_t>();
-            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
-            DataCopyPad(aL, aGm_[bi * HV], cp, {false, 0, 0, 0});
-            qA_.EnQue(aL);
-            aL = qA_.DeQue<bfloat16_t>();
-            Cast<float, bfloat16_t>(aT_, aL, RoundMode::CAST_NONE, HV);
-            qA_.FreeTensor(aL);
-        }
-        {
-            LocalTensor<float> dL = qDb_.AllocTensor<float>();
-            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(float)), 0, 0, 0};
-            DataCopyPad(dL, dbGm_, cp, {false, 0, 0, 0});
-            qDb_.EnQue(dL);
-            dL = qDb_.DeQue<float>();
-            Add(sT_, aT_, dL, HV);
-            qDb_.FreeTensor(dL);
-        }
-        PipeBarrier<PIPE_V>();
-        Exp(sT_, sT_, HV);
-        Adds(sT_, sT_, 1.0f, HV);
-        Ln(sT_, sT_, HV);
-        Mul(eG_, eG_, sT_, HV);
-        Exp(eG_, eG_, HV);
-
-        // --- Step 5 BETA ---
-        {
-            LocalTensor<bfloat16_t> bL = qB_.AllocTensor<bfloat16_t>();
-            DataCopyExtParams cp ={1, (uint16_t)(HV * sizeof(bfloat16_t)), 0, 0, 0};
-            DataCopyPad(bL, bGm_[bi * HV], cp, {false, 0, 0, 0});
-            qB_.EnQue(bL);
-            bL = qB_.DeQue<bfloat16_t>();
-            Cast<float, bfloat16_t>(sT_, bL, RoundMode::CAST_NONE, HV);
-            qB_.FreeTensor(bL);
-        }
-        PipeBarrier<PIPE_V>();
-        Sigmoid<float>(beB_, sT_, sgT_, HV);
-        PipeBarrier<PIPE_MTE3>();
-
-        // --- Step 6+7 RECURRENCE + OUTPUT (vStep-tiled, double-buffered) ---
-        for (uint32_t hvi = 0; hvi < HV; ++hvi) {
             uint32_t hki  = (G > 0) ? (hvi / G) : hvi;
             uint32_t sOff = ((uint32_t)sid * HV + hvi) * DV * DK;
             float    ev   = eG_.GetValue(hvi);

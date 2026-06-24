@@ -19,6 +19,7 @@ struct FusedRgdrPackedDecodeTilingData {
     uint32_t G = 0;
     uint32_t L_qkv = 0;
     uint32_t batchPerCore = 0;
+    uint32_t totalUnits = 0;     // B * HV, for dynamic BlockDim
     uint32_t dkAligned = 0;
     uint32_t dvAligned = 0;
     float scaleVal = 0.0f;

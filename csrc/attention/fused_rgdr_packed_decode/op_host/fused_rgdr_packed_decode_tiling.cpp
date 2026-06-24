@@ -133,6 +133,7 @@ ge::graphStatus FusedRgdrPackedDecodeTilingFunc(gert::TilingContext* context)
     }
     uint32_t G = (HK > 0) ? (HV / HK) : 0;
 
+    uint32_t totalUnits = B * HV;
     uint32_t batchPerCore = (B + totalCores - 1) / totalCores;
     uint32_t dkAligned = ((DK + 7) / 8) * 8;
     uint32_t dvAligned = ((DV + 7) / 8) * 8;
@@ -156,6 +157,7 @@ ge::graphStatus FusedRgdrPackedDecodeTilingFunc(gert::TilingContext* context)
     tiling->B = B; tiling->HK = HK; tiling->HV = HV;
     tiling->DK = DK; tiling->DV = DV; tiling->N = N;
     tiling->G = G; tiling->L_qkv = L;
+    tiling->totalUnits = totalUnits;
     tiling->batchPerCore = batchPerCore;
     tiling->dkAligned = dkAligned; tiling->dvAligned = dvAligned;
 
@@ -193,12 +195,15 @@ ge::graphStatus FusedRgdrPackedDecodeTilingFunc(gert::TilingContext* context)
         return ge::GRAPH_FAILED;
     }
 
-    context->SetBlockDim(ascendcPlatform.CalcTschNumBlocks(aivNum, aicNum, aivNum));
-    auto blockDim = context->GetBlockDim();
-    if (blockDim == 0) {
-        blockDim = static_cast<int64_t>(aivNum);
-        context->SetBlockDim(blockDim);
+    // Dynamic BlockDim: don't launch more cores than work units (RGDR pattern)
+    uint64_t taskUnits = static_cast<uint64_t>(totalUnits);
+    uint64_t maxCoreNum = (aivNum > 0) ? static_cast<uint64_t>(aivNum) : 0;
+    uint64_t selectedCoreNum = (taskUnits < maxCoreNum) ? taskUnits : maxCoreNum;
+    uint32_t blockDimVal = static_cast<uint32_t>(selectedCoreNum);
+    if (blockDimVal == 0) {
+        blockDimVal = 1;
     }
+    context->SetBlockDim(static_cast<int64_t>(blockDimVal));
 
     return ge::GRAPH_SUCCESS;
 }
