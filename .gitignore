@@ -222,3 +222,4 @@ csrc/third_party/
 .codegraph/
 
 .vllm_ascend/
+csrc/attention/fused_rgdr_packed_decode/bench_*.txt
