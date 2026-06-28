@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Performance benchmark for fused_rgdr_packed_decode."""
+"""Performance benchmark for fused_rgdr_packed_decode.
+
+Test cases aligned with test_fused_rgdr_packed_decode.py correctness tests.
+"""
 
 import time
 import torch
@@ -23,7 +26,7 @@ def bench(name, mixed_qkv, a, b, a_log, dt_bias, state, si, scale=1.0,
             mq, an, bn, al, db, st_warm, si_n, scale)
     torch.npu.synchronize()
 
-    # Timed runs -- clone once, then reuse by filling with original
+    # Timed runs
     st_work = st0.clone()
     start = time.perf_counter()
     for _ in range(repeat):
@@ -34,52 +37,70 @@ def bench(name, mixed_qkv, a, b, a_log, dt_bias, state, si, scale=1.0,
     elapsed = time.perf_counter() - start
     avg_us = elapsed / repeat * 1e6
 
-    print(f"  {name:40s} avg={avg_us:8.1f} us  ({repeat} runs)")
+    print(f"  {name:45s} avg={avg_us:8.1f} us  ({repeat} runs)")
     return avg_us
 
 
-def make_inputs(B, HV, DV, DK, N=8, seed=42, state_dtype=torch.float32):
+def make_inputs_e2e(HK, HV, DV, DK, B=1, N=8, seed=42, state_dtype=torch.float32):
+    """Build inputs with independent HK/HV (matching _make_inputs_e2e in test)."""
     torch.manual_seed(seed)
-    HK = HV
     L = 2 * HK * DK + HV * DV
-    return (
-        torch.randn(B, L, dtype=torch.bfloat16),
-        torch.randn(B, HV, dtype=torch.bfloat16),
-        torch.randn(B, HV, dtype=torch.bfloat16),
-        torch.randn(HV, dtype=torch.float32),
-        torch.randn(HV, dtype=torch.float32),
-        torch.randn(N, HV, DV, DK, dtype=state_dtype),
-        torch.randperm(N)[:B].to(torch.int32),
-    )
+    mixed_qkv = torch.randn(B, L, dtype=torch.bfloat16)
+    a = torch.randn(B, HV, dtype=torch.bfloat16)
+    b = torch.randn(B, HV, dtype=torch.bfloat16)
+    a_log = torch.randn(HV, dtype=torch.float32)
+    dt_bias = torch.randn(HV, dtype=torch.float32)
+    state = torch.randn(N, HV, DV, DK, dtype=state_dtype)
+    si = torch.randperm(N)[:B].to(torch.int32)
+    return mixed_qkv, a, b, a_log, dt_bias, state, si
 
 
 def main():
     print("=== Single-op Performance Benchmark ===\n")
 
-    # ---- Model-like dimensions (Qwen3.5-0.8B) ----
-    # DV=DK=128, HV=HK=16  (the real decode scenario)
-    print("--- Model-like (DV=DK=128, HV=16) ---")
-    for B in [1, 2, 4, 8, 10]:
-        mq, a, b, al, db, st, si = make_inputs(B, 16, 128, 128, N=max(16, B))
-        bench(f"B={B:3d}, HV=16, DV=DK=128", mq, a, b, al, db, st, si)
+    # ---- Basic correctness-aligned cases (DV=DK=16) ----
+    print("--- Basic cases (DV=DK=16, matching test_hv8_b1/hv8_b4/hv16) ---")
+    for B, HV in [(1, 8), (4, 8), (1, 16)]:
+        HK = HV  # G=1
+        mq, a, b, al, db, st, si = make_inputs_e2e(HK, HV, 8, 16, B=B, N=max(8, B))
+        bench(f"G=1, B={B:2d}, HK={HK:2d}, HV={HV:2d}", mq, a, b, al, db, st, si)
+        import gc; gc.collect()
+        torch.npu.empty_cache()
 
-    # ---- Batch scaling with large state ----
-    print("\n--- Batch scaling (HV=32, DV=DK=128) ---")
-    for B in [1, 4, 16, 32, 64]:
-        mq, a, b, al, db, st, si = make_inputs(B, 32, 128, 128, N=max(64, B))
-        bench(f"B={B:3d}, HV=32, DV=DK=128", mq, a, b, al, db, st, si)
+    # ---- E2E combos (DV=DK=128, matching _E2E_COMBOS in test) ----
+    _COMBOS = [(8, 8), (8, 16), (8, 24), (8, 32), (8, 64),
+               (16, 16), (16, 32), (16, 64)]
+    print("\n--- E2E combos (DV=DK=128, matching test_e2e_combos) ---")
+    for HK, HV in _COMBOS:
+        G = HV // HK
+        mq, a, b, al, db, st, si = make_inputs_e2e(HK, HV, 128, 128, N=max(8, 1))
+        bench(f"G={G}, B=1, HK={HK:2d}, HV={HV:2d}", mq, a, b, al, db, st, si)
+        import gc; gc.collect()
+        torch.npu.empty_cache()
 
-    # ---- HV scaling ----
-    print("\n--- HV scaling (B=1, DV=DK=128) ---")
-    for HV in [8, 16, 24, 32]:
-        mq, a, b, al, db, st, si = make_inputs(1, HV, 128, 128)
-        bench(f"B=1, HV={HV:3d}, DV=DK=128", mq, a, b, al, db, st, si)
+    # ---- Batch scaling (DV=DK=128, HK=8, HV=32, matching test_batch) ----
+    print("\n--- Batch scaling (HK=8, HV=32, DV=DK=128, matching test_batch) ---")
+    for B in [2, 4, 8]:
+        mq, a, b, al, db, st, si = make_inputs_e2e(8, 32, 128, 128, B=B, N=max(8, B))
+        bench(f"G=4, B={B:2d}, HK= 8, HV=32", mq, a, b, al, db, st, si)
+        import gc; gc.collect()
+        torch.npu.empty_cache()
 
-    # ---- bf16 state ----
-    print("\n--- bf16 state ---")
-    mq, a, b, al, db, st_bf16, si = make_inputs(
-        1, 16, 128, 128, state_dtype=torch.bfloat16)
-    bench(f"B=1, HV=16, DV=DK=128 (bf16 state)", mq, a, b, al, db, st_bf16, si)
+    # ---- bf16 state (DV=DK=16, matching test_bf16_state) ----
+    print("\n--- bf16 state (DV=DK=16, matching test_bf16_state) ---")
+    mq, a, b, al, db, st_b16, si = make_inputs_e2e(
+        16, 16, 8, 16, B=2, N=8, state_dtype=torch.bfloat16)
+    bench(f"G=1, B= 2, HK=16, HV=16 (bf16 state)", mq, a, b, al, db, st_b16, si)
+    import gc; gc.collect()
+    torch.npu.empty_cache()
+
+    # ---- Model-like: Qwen3.6-27B GDN config (G=3, DV=DK=128) ----
+    print("\n--- Model-like (DV=DK=128, HK=16, HV=48, G=3, matching Qwen3.6-27B) ---")
+    for B in [1, 4, 10]:
+        mq, a, b, al, db, st, si = make_inputs_e2e(16, 48, 128, 128, B=B, N=max(48, B))
+        bench(f"G=3, B={B:2d}, HK=16, HV=48", mq, a, b, al, db, st, si)
+        import gc; gc.collect()
+        torch.npu.empty_cache()
 
     print("\nDone.")
 
