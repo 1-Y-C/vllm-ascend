@@ -15,6 +15,8 @@
 # limitations under the License.
 #
 
+import time
+
 import torch
 import torch_npu
 from einops import rearrange
@@ -41,6 +43,14 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_fn
 from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
+
+# --- Decode timing (用于融合路径 vs 原版本微观对比) ---
+_DECODE_TIMING_FILE = "/workspace/decode_times.csv"
+_DECODE_STEP_ENABLED = True
+
+def _record_decode_time(path, num_tokens, elapsed_ms):
+    with open(_DECODE_TIMING_FILE, "a") as f:
+        f.write(f"{path},{num_tokens},{elapsed_ms:.3f}\n")
 
 
 def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
@@ -407,7 +417,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         spec_query_start_loc = attn_metadata.spec_query_start_loc
         non_spec_query_start_loc = attn_metadata.non_spec_query_start_loc
         spec_sequence_masks = attn_metadata.spec_sequence_masks
-        spec_token_indx = attn_metadata.spec_token_indx
         non_spec_token_indx = attn_metadata.non_spec_token_indx
         spec_state_indices_tensor = attn_metadata.spec_state_indices_tensor  # noqa: E501
         non_spec_state_indices_tensor = attn_metadata.non_spec_state_indices_tensor  # noqa: E501
@@ -416,7 +425,6 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
 
-        # if False and (
         if (
             attn_metadata.spec_sequence_masks is None
             and attn_metadata.num_prefills == 0
@@ -507,6 +515,8 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv = output_non_spec
 
             scale_val = float(self.head_k_dim ** -0.5)
+            if _DECODE_STEP_ENABLED and not _EXTRA_CTX.capturing:
+                _t0 = time.perf_counter()
             result = torch.ops._C_ascend.npu_fused_rgdr_packed_decode(
                 mixed_qkv, a, b,
                 self.A_log, self.dt_bias.to(dtype=torch.float32),
@@ -514,6 +524,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 non_spec_state_indices_tensor[:num_actual_tokens],
                 scale_val,
             )
+            if _DECODE_STEP_ENABLED and not _EXTRA_CTX.capturing:
+                torch.npu.synchronize()
+                _t1 = time.perf_counter()
+                _record_decode_time('fused', int(num_actual_tokens), (_t1 - _t0) * 1000)
             core_attn_out[:num_actual_tokens] = result.squeeze(1)
             return
 
@@ -731,6 +745,12 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
         query_non_spec, key_non_spec, value_non_spec = self.rearrange_mixed_qkv(mixed_qkv_non_spec)
 
+        # --- timing: measure gate + l2norm + recurrence (original path) ---
+        if (_DECODE_STEP_ENABLED and not _EXTRA_CTX.capturing
+                and spec_sequence_masks is None
+                and attn_metadata.num_decodes > 0):
+            _t0 = time.perf_counter()
+
         # 2. Recurrent attention
         g, beta = DeviceOperator.fused_gdn_gating(self.A_log, a, b, self.dt_bias)
         if spec_sequence_masks is not None:
@@ -813,6 +833,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
+
+            # --- end timing: original decode path ---
+            if (_DECODE_STEP_ENABLED and not _EXTRA_CTX.capturing
+                    and spec_sequence_masks is None):
+                torch.npu.synchronize()
+                _t1 = time.perf_counter()
+                _record_decode_time('original', int(num_actual_tokens), (_t1 - _t0) * 1000)
         else:
             core_attn_out_non_spec, last_recurrent_state = None, None
 
