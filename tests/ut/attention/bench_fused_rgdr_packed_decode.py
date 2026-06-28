@@ -95,12 +95,17 @@ def main():
     torch.npu.empty_cache()
 
     # ---- Model-like: Qwen3.6-27B GDN config (G=3, DV=DK=128) ----
-    print("\n--- Model-like (DV=DK=128, HK=16, HV=48, G=3, matching Qwen3.6-27B) ---")
+    print("\n--- Model-like (DV=DK=128, G=3, matching Qwen3.6-27B) ---")
+    # TP=1: full heads (HK=16, HV=48)
     for B in [1, 4, 10]:
         mq, a, b, al, db, st, si = make_inputs_e2e(16, 48, 128, 128, B=B, N=max(48, B))
-        bench(f"G=3, B={B:2d}, HK=16, HV=48", mq, a, b, al, db, st, si)
-        import gc; gc.collect()
-        torch.npu.empty_cache()
+        bench(f"TP1, B={B:2d}, HK=16, HV=48", mq, a, b, al, db, st, si)
+        gc.collect(); torch.npu.empty_cache()
+    # TP=2: half heads per card (HK=8, HV=24), G=3 preserved
+    for B in [1, 4, 10]:
+        mq, a, b, al, db, st, si = make_inputs_e2e(8, 24, 128, 128, B=B, N=max(24, B))
+        bench(f"TP2, B={B:2d}, HK= 8, HV=24", mq, a, b, al, db, st, si)
+        gc.collect(); torch.npu.empty_cache()
 
     print("\nDone.")
 
